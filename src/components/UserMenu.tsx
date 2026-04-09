@@ -1,19 +1,26 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { useAuth } from "@/contexts/AuthContext";
+import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 
 export const UserMenu = () => {
-  const { currentUser, login, logout, changePassword } = useAuth();
-  const [showLogin, setShowLogin] = useState(false);
+  const { t } = useTranslation();
+  const { currentUser, logout, changePassword } = useAuth();
   const [showChangePassword, setShowChangePassword] = useState(false);
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -21,8 +28,10 @@ export const UserMenu = () => {
 
   const mustChangePassword = !!currentUser?.mustChangePassword;
   const roleLabel = currentUser?.roles?.includes("admin")
-    ? "admin"
-    : currentUser?.roles?.join(", ");
+    ? t("dashboard.roles.admin")
+    : currentUser?.roles?.includes("manager")
+    ? t("dashboard.roles.manager")
+    : t("dashboard.roles.annotator");
 
   useEffect(() => {
     if (mustChangePassword) {
@@ -30,26 +39,14 @@ export const UserMenu = () => {
     }
   }, [mustChangePassword]);
 
-  const handleLogin = async () => {
-    const ok = await login(username, password);
-    if (!ok) {
-      setError("Invalid username or password");
-      return;
-    }
-    setError("");
-    setShowLogin(false);
-    setUsername("");
-    setPassword("");
-  };
-
   const handleChangePassword = async () => {
     if (newPassword !== confirmPassword) {
-      setChangeError("Passwords do not match");
+      setChangeError(t("auth.passwordsDoNotMatch"));
       return;
     }
     const result = await changePassword(currentPassword, newPassword);
     if (!result.ok) {
-      setChangeError(result.error || "Failed to change password");
+      setChangeError(result.error || t("auth.changePasswordFailed"));
       return;
     }
     setChangeError("");
@@ -60,77 +57,49 @@ export const UserMenu = () => {
   };
 
   if (!currentUser) {
-    return (
-      <>
-        <Button size="sm" variant="outline" onClick={() => setShowLogin(true)}>
-          Login
-        </Button>
-        <Dialog open={showLogin} onOpenChange={setShowLogin}>
-          <DialogContent className="max-w-sm">
-            <DialogHeader>
-              <DialogTitle>Login</DialogTitle>
-            </DialogHeader>
-            <div className="space-y-3">
-              <div className="space-y-1.5">
-                <Label htmlFor="login-username">Username</Label>
-                <Input id="login-username" value={username} onChange={(e) => setUsername(e.target.value)} />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="login-password">Password</Label>
-                <Input id="login-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
-              </div>
-              {error && <p className="text-sm text-destructive">{error}</p>}
-            </div>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setShowLogin(false)}>Cancel</Button>
-              <Button onClick={handleLogin}>Login</Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-      </>
-    );
+    return null;
   }
+
+  const initials = currentUser.username.slice(0, 2).toUpperCase();
 
   return (
     <>
       <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button size="sm" variant="outline" className="gap-2">
-            {currentUser.username}
-            <Badge variant="secondary" className="text-[10px] uppercase">
-              {roleLabel}
-            </Badge>
-          </Button>
-        </DropdownMenuTrigger>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <DropdownMenuTrigger asChild>
+              <Button size="icon" variant="ghost" className="h-8 w-8 rounded-full p-0">
+                <span className="flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-blue-500 to-purple-600 text-[11px] font-semibold text-white">
+                  {initials}
+                </span>
+              </Button>
+            </DropdownMenuTrigger>
+          </TooltipTrigger>
+          <TooltipContent>
+            <span>{currentUser.username}</span>
+            <Badge variant="secondary" className="ml-1.5 text-[10px] uppercase">{roleLabel}</Badge>
+          </TooltipContent>
+        </Tooltip>
         <DropdownMenuContent align="end">
-          <DropdownMenuItem onClick={() => setShowLogin(true)}>Switch User</DropdownMenuItem>
-          <DropdownMenuItem onClick={() => setShowChangePassword(true)}>Change Password</DropdownMenuItem>
-          <DropdownMenuItem onClick={logout}>Log Out</DropdownMenuItem>
+          <DropdownMenuLabel className="font-normal">
+            <div className="flex flex-col gap-0.5">
+              <span className="text-sm font-medium">{currentUser.username}</span>
+              <span className="text-xs text-muted-foreground uppercase">{roleLabel}</span>
+            </div>
+          </DropdownMenuLabel>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onClick={() => setShowChangePassword(true)}>
+            {t("auth.changePassword")}
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
+            {t("user.language")}
+          </DropdownMenuLabel>
+          <LanguageSwitcher />
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onClick={logout}>{t("user.logout")}</DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
-
-      <Dialog open={showLogin} onOpenChange={setShowLogin}>
-        <DialogContent className="max-w-sm">
-          <DialogHeader>
-            <DialogTitle>Switch User</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-3">
-            <div className="space-y-1.5">
-              <Label htmlFor="switch-username">Username</Label>
-              <Input id="switch-username" value={username} onChange={(e) => setUsername(e.target.value)} />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="switch-password">Password</Label>
-              <Input id="switch-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
-            </div>
-            {error && <p className="text-sm text-destructive">{error}</p>}
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setShowLogin(false)}>Cancel</Button>
-            <Button onClick={handleLogin}>Switch</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
 
       <Dialog
         open={showChangePassword || mustChangePassword}
@@ -141,11 +110,13 @@ export const UserMenu = () => {
       >
         <DialogContent className="max-w-sm">
           <DialogHeader>
-            <DialogTitle>{mustChangePassword ? "Set a new password" : "Change Password"}</DialogTitle>
+            <DialogTitle>
+              {mustChangePassword ? t("auth.setNewPassword") : t("auth.changePassword")}
+            </DialogTitle>
           </DialogHeader>
           <div className="space-y-3">
             <div className="space-y-1.5">
-              <Label htmlFor="current-password">Current password</Label>
+              <Label htmlFor="current-password">{t("auth.currentPassword")}</Label>
               <Input
                 id="current-password"
                 type="password"
@@ -154,7 +125,7 @@ export const UserMenu = () => {
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="new-password">New password</Label>
+              <Label htmlFor="new-password">{t("auth.newPassword")}</Label>
               <Input
                 id="new-password"
                 type="password"
@@ -163,7 +134,7 @@ export const UserMenu = () => {
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="confirm-password">Confirm new password</Label>
+              <Label htmlFor="confirm-password">{t("auth.confirmPassword")}</Label>
               <Input
                 id="confirm-password"
                 type="password"
@@ -174,17 +145,17 @@ export const UserMenu = () => {
             {changeError && <p className="text-sm text-destructive">{changeError}</p>}
             {mustChangePassword && (
               <p className="text-xs text-muted-foreground">
-                You must change your password before continuing.
+                {t("auth.mustChangePassword")}
               </p>
             )}
           </div>
           <DialogFooter>
             {!mustChangePassword && (
               <Button variant="outline" onClick={() => setShowChangePassword(false)}>
-                Cancel
+                {t("common.cancel")}
               </Button>
             )}
-            <Button onClick={handleChangePassword}>Save</Button>
+            <Button onClick={handleChangePassword}>{t("common.save")}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

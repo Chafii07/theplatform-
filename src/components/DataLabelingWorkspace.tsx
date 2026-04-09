@@ -1,13 +1,16 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useSearchParams } from "react-router-dom";
+import { useTranslation } from "react-i18next";
+import { useLanguage } from "@/contexts/LanguageContext";
 import { Tiktoken } from "js-tiktoken/lite";
 import o200k_base from "js-tiktoken/ranks/o200k_base";
 import cl100k_base from "js-tiktoken/ranks/cl100k_base";
 
 import { useDataLabeling } from "@/hooks/useDataLabeling";
-import { exportService } from "@/services/exportService";
+import { generateId } from "@/lib/utils";
+import { exportService, HF_FIELD_CONFIG, FieldConfig } from "@/services/exportService";
 import { huggingFaceService } from "@/services/huggingFaceService";
-import { DataPoint, ModelProfile, ModelProvider, Project, ProjectModelPolicy, ProviderConnection } from "@/types/data";
+import { DataPoint, DataPointComment, ModelProfile, ModelProvider, Project, ProjectModelPolicy, ProviderConnection } from "@/types/data";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
@@ -23,11 +26,18 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { toast } from "@/components/ui/use-toast";
 import { MetadataSidebar } from "@/components/MetadataSidebar";
+import { GuidelinesSidebar } from "@/components/GuidelinesSidebar";
 import { DynamicAnnotationForm } from "@/components/DynamicAnnotationForm";
+import { AnnotationQualityDashboard } from "@/components/qa/AnnotationQualityDashboard";
 import { AnnotationConfig, loadDefaultAnnotationConfig, loadAnnotationConfigFromFile, parseAnnotationConfigXML } from "@/services/xmlConfigService";
+import { buildSchemaPrompt, mapFieldConfigType } from "@/services/annotationSchema";
+import type { AnnotationSchema } from "@/types/data";
 import { useAuth } from "@/contexts/AuthContext";
 import { UserMenu } from "@/components/UserMenu";
 import { ThemeToggle } from "@/components/ThemeToggle";
+import { NotificationBell } from "@/components/NotificationBell";
+import { useTutorial, hasSeenTutorial } from "@/components/Tutorial/useTutorial";
+import { getWorkspaceSteps } from "@/components/Tutorial/tourSteps";
 import {
   Upload,
   Settings,
@@ -63,20 +73,58 @@ import {
   Star,
   User,
   ArrowLeft,
+  ArrowRight,
   Undo2,
   Redo2,
-  History
+  History,
+  Database,
+  MessageSquare,
+  Trash2,
+  HelpCircle,
+  Book
 } from "lucide-react";
 import { VersionHistory } from "@/components/VersionHistory";
 import { projectService } from "@/services/projectService";
 import { modelManagementService } from "@/services/modelManagementService";
+import apiClient, { getAuthToken } from "@/services/apiClient";
+import { useDataImport } from "@/hooks/useDataImport";
+import { ImportWizard } from "@/components/ImportWizard";
+import { TextClassificationView } from "@/components/annotation/TextClassificationView";
 
 type AnnotationStatusFilter = 'all' | 'has_final' | DataPoint['status'];
+const COMMENTS_PAGE_SIZE = 10;
+
+const parseAiSuggestionToFieldValues = (
+  suggestion: string,
+  fieldIds: Set<string>
+): Record<string, string | boolean> => {
+  try {
+    const parsed = JSON.parse(suggestion);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, string | boolean>;
+    }
+  } catch { /* not JSON */ }
+
+  const result: Record<string, string | boolean> = {};
+  for (const line of suggestion.split('\n')) {
+    const sep = line.indexOf(': ');
+    if (sep === -1) continue;
+    const key = line.slice(0, sep).trim();
+    const value = line.slice(sep + 2).trim();
+    if (fieldIds.has(key)) {
+      result[key] = value === 'true' ? true : value === 'false' ? false : value;
+    }
+  }
+  return result;
+};
 
 const DataLabelingWorkspace = () => {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
-  const { currentUser } = useAuth();
+  const { t } = useTranslation();
+  const { isRTL } = useLanguage();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const { currentUser, getUserById } = useAuth();
   const annotatorMeta = currentUser ? { id: currentUser.id, name: currentUser.username } : undefined;
 
   // Use custom hook for core logic
@@ -97,6 +145,12 @@ const DataLabelingWorkspace = () => {
     currentDataPoint,
     isCompleted,
     progress,
+    page,
+    pageSize,
+    statusCounts,
+    globalCompletedCount,
+    globalRemainingCount,
+    globalTotalItems,
     handleNext,
     handlePrevious,
     handleAcceptAnnotation,
@@ -119,9 +173,11 @@ const DataLabelingWorkspace = () => {
   const [showSettings, setShowSettings] = useState(false);
   const [showUploadPrompt, setShowUploadPrompt] = useState(false);
   const [projectAccess, setProjectAccess] = useState<Project | null>(null);
+  const [aiInstruction, setAiInstruction] = useState('');
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [uploadPrompt, setUploadPrompt] = useState('');
+
 
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [processingProgress, setProcessingProgress] = useState({ current: 0, total: 0 });
@@ -135,6 +191,13 @@ const DataLabelingWorkspace = () => {
   const [pendingProcessForce, setPendingProcessForce] = useState(false);
   const [tokenEstimate, setTokenEstimate] = useState<{ inputTokens: number; items: number; models: number; perModelTokens: Record<string, number> } | null>(null);
   const [openRouterPriceByModel, setOpenRouterPriceByModel] = useState<Record<string, { input: number | null; output: number | null }>>({});
+  const [comments, setComments] = useState<DataPointComment[]>([]);
+  const [commentsLoading, setCommentsLoading] = useState(false);
+  const [commentsPage, setCommentsPage] = useState(1);
+  const [commentsTotalPages, setCommentsTotalPages] = useState(1);
+  const [commentDraft, setCommentDraft] = useState('');
+  const [editingCommentId, setEditingCommentId] = useState<string | null>(null);
+  const [editingCommentBody, setEditingCommentBody] = useState('');
 
   // Redirect if project not found
   useEffect(() => {
@@ -146,8 +209,13 @@ const DataLabelingWorkspace = () => {
   useEffect(() => {
     const loadAccess = async () => {
       if (!projectId) return;
+
+      // Initialize model management first so connections/profiles are available
+      await modelManagementService.initialize();
+
       const project = await projectService.getById(projectId);
       setProjectAccess(project ?? null);
+      setAiInstruction(project?.aiInstruction ?? '');
     };
     loadAccess();
   }, [projectId]);
@@ -156,10 +224,36 @@ const DataLabelingWorkspace = () => {
   const isManagerForProject = currentUser?.roles?.includes("manager") && projectAccess?.managerId === currentUser.id;
   const isAnnotatorForProject = currentUser?.roles?.includes("annotator") && (projectAccess?.annotatorIds || []).includes(currentUser.id);
   const canViewProject = !!currentUser && (isAdmin || isManagerForProject || isAnnotatorForProject);
+  const canViewIaaDetails = isAdmin || isManagerForProject;
   const canUpload = isAdmin || isManagerForProject;
   const canProcessAI = isAdmin || isManagerForProject;
   const canExport = isAdmin || isManagerForProject;
   const accessDenied = !!projectAccess && !!currentUser && !canViewProject;
+
+  const workspaceTutorialSteps = getWorkspaceSteps(canUpload);
+  const { startTour: startWorkspaceTour } = useTutorial({
+    userId: currentUser?.id ?? "guest",
+    steps: workspaceTutorialSteps,
+    labels: {
+      next: t("workspace.tourNext"),
+      prev: t("workspace.tourPrev"),
+      done: t("workspace.tourDone"),
+      stepOf: t("workspace.tourStepOf"),
+    },
+  });
+
+  useEffect(() => {
+    if (!currentUser || dataPoints.length === 0) return;
+    const wsKey = `tutorial_seen_v1_ws_${currentUser.id}`;
+    if (!localStorage.getItem(wsKey)) {
+      const timer = setTimeout(() => {
+        localStorage.setItem(wsKey, "1");
+        startWorkspaceTour();
+      }, 800);
+      return () => clearTimeout(timer);
+    }
+  }, [currentUser, dataPoints.length]);
+
   const logProjectAction = async (action: 'upload' | 'ai_process' | 'export', details?: string) => {
     if (!projectId || !currentUser) return;
     try {
@@ -173,6 +267,29 @@ const DataLabelingWorkspace = () => {
       console.error("Failed to log project action:", error);
     }
   };
+
+  // ── Import wizard (unified import flow) ───────────────────────────────────
+  const {
+    isWizardOpen,
+    isUploading: isWizardUploading,
+    openWizard,
+    closeWizard,
+    importData,
+    importMultipleFiles,
+    fetchHuggingFaceRows,
+  } = useDataImport({
+    projectId,
+    projectAccess,
+    canUpload,
+    onImported: async (newDataPoints) => {
+      loadNewData(newDataPoints);
+      if (projectId) {
+        await projectService.saveProgress(projectId, newDataPoints, annotationStats);
+      }
+      await logProjectAction('upload', `Items: ${newDataPoints.length}`);
+    },
+    onAnnotationLabelDetected: (label) => setAnnotationLabel(label),
+  });
 
   useEffect(() => {
     if (!projectAccess || !currentUser) return;
@@ -194,6 +311,8 @@ const DataLabelingWorkspace = () => {
   const [selectedContentColumn, setSelectedContentColumn] = useState<string>('');
   const [selectedDisplayColumns, setSelectedDisplayColumns] = useState<string[]>([]);
   const [showMetadataSidebar, setShowMetadataSidebar] = useState(true);
+  const [showGuidelinesSidebar, setShowGuidelinesSidebar] = useState(false);
+  const [showRightSidebar, setShowRightSidebar] = useState(true);
   const [showExportDialog, setShowExportDialog] = useState(false);
   const [annotationQuery, setAnnotationQuery] = useState('');
   const [annotationStatusFilter, setAnnotationStatusFilter] = useState<AnnotationStatusFilter>('all');
@@ -203,21 +322,33 @@ const DataLabelingWorkspace = () => {
   const [listLayout, setListLayout] = useState<'grid' | 'list'>('grid');
   const [metadataFilters, setMetadataFilters] = useState<Record<string, string[]>>({});
   const [metadataFiltersCollapsed, setMetadataFiltersCollapsed] = useState(true);
+  const [annotatedByFilter, setAnnotatedByFilter] = useState<string>('all');
+  const [annotatedTimeFilter, setAnnotatedTimeFilter] = useState<string>('all');
   const [useFilteredNavigation, setUseFilteredNavigation] = useState(false);
 
   // Advanced Features State
   const [showHistoryDialog, setShowHistoryDialog] = useState(false);
+  const [showQualityDialog, setShowQualityDialog] = useState(false);
 
   // Hugging Face State
   const [showHFDialog, setShowHFDialog] = useState(false);
   const [showPublishSuccessDialog, setShowPublishSuccessDialog] = useState(false);
   const [publishedUrl, setPublishedUrl] = useState('');
-  const [hfUsername, setHfUsername] = useState(() => localStorage.getItem('databayt-hf-username') || '');
-  const [hfToken, setHfToken] = useState(() => localStorage.getItem('databayt-hf-token') || '');
+  const [hfUsername, setHfUsername] = useState(() => sessionStorage.getItem('databayt-hf-username') || '');
+  const [hfToken, setHfToken] = useState(() => sessionStorage.getItem('databayt-hf-token') || '');
   const [hfDatasetName, setHfDatasetName] = useState('');
+  const [showHFImportDialog, setShowHFImportDialog] = useState(false);
+  const [isImportingHF, setIsImportingHF] = useState(false);
+  const [hfImportDataset, setHfImportDataset] = useState('');
+  const [hfImportConfig, setHfImportConfig] = useState('');
+  const [hfImportSplit, setHfImportSplit] = useState('');
+  const [hfImportMaxRows, setHfImportMaxRows] = useState<number | ''>('');
+  const [pendingHFRows, setPendingHFRows] = useState<Array<Record<string, unknown>> | null>(null);
+  const [handledInitialImportChoice, setHandledInitialImportChoice] = useState(false);
+  const [publishProgress, setPublishProgress] = useState<{ step: string; pct: number } | null>(null);
 
   // Dynamic Labels
-  const [annotationLabel, setAnnotationLabel] = useState('Original Annotation');
+  const [annotationLabel, setAnnotationLabel] = useState(() => t('workspace.originalAnnotation'));
   const [promptLabel, setPromptLabel] = useState('Upload Instructions');
   const [isPublishing, setIsPublishing] = useState(false);
 
@@ -227,8 +358,7 @@ const DataLabelingWorkspace = () => {
   // XML Annotation Config State
   const [annotationConfig, setAnnotationConfig] = useState<AnnotationConfig | null>(null);
   const [annotationFieldValuesMap, setAnnotationFieldValuesMap] = useState<Record<string, Record<string, string | boolean>>>({});
-  const [showXmlEditor, setShowXmlEditor] = useState(false);
-  const [xmlEditorContent, setXmlEditorContent] = useState('');
+
 
   const dataPointsRef = useRef<DataPoint[]>(dataPoints);
   const inflightRef = useRef(0);
@@ -291,6 +421,14 @@ const DataLabelingWorkspace = () => {
       "claude-3-5-sonnet-20240620": 3,
       "claude-3-opus-20240229": 15,
       "claude-3-haiku-20240307": 0.25
+    },
+    gemini: {
+      "gemini-2.0-flash": 0.1,
+      "gemini-2.0-flash-lite": 0.075,
+      "gemini-1.5-pro": 1.25,
+      "gemini-1.5-pro-001": 1.25,
+      "gemini-1.5-flash": 0.075,
+      "gemini-1.5-flash-001": 0.075
     }
   }), []);
 
@@ -334,12 +472,11 @@ const DataLabelingWorkspace = () => {
 
       await Promise.all(uniqueConnections.map(async connection => {
         try {
-          const response = await fetch('/api/openrouter/models', {
+          const token = getAuthToken();
+          const response = await fetch(`/api/openrouter/models?connectionId=${encodeURIComponent(connection.id)}`, {
             method: 'GET',
             signal: controller.signal,
-            headers: {
-              Authorization: `Bearer ${connection.apiKey}`
-            }
+            headers: token ? { Authorization: `Bearer ${token}` } : {},
           });
           if (!response.ok) return;
           const payload = await response.json();
@@ -374,7 +511,42 @@ const DataLabelingWorkspace = () => {
     setSelectedModels(prev => prev.filter(id => allowed.has(id)));
   }, [availableModelProfiles]);
 
-  const allowedDataFileExtensions = ['.json', '.csv', '.txt'];
+  const audioFileExtensions = ['.mp3', '.wav', '.m4a'];
+  const allowedDataFileExtensions = ['.json', '.csv', '.txt', ...audioFileExtensions];
+
+  useEffect(() => {
+    if (handledInitialImportChoice || !canUpload) return;
+
+    const requestedImport = searchParams.get('import');
+    if (!requestedImport) {
+      setHandledInitialImportChoice(true);
+      return;
+    }
+
+    // Both 'huggingface' and 'file' now open the unified ImportWizard
+    if (requestedImport === 'huggingface' || requestedImport === 'file') {
+      openWizard();
+    }
+
+    setHandledInitialImportChoice(true);
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.delete('import');
+    setSearchParams(nextParams, { replace: true });
+  }, [handledInitialImportChoice, canUpload, searchParams, setSearchParams]);
+
+  // Jump to a specific data point when arriving from a notification (?dp=<id>)
+  useEffect(() => {
+    const targetId = searchParams.get('dp');
+    if (!targetId || dataPoints.length === 0) return;
+    const idx = dataPoints.findIndex(dp => dp.id === targetId);
+    if (idx !== -1) {
+      setCurrentIndex(idx);
+      setViewMode('record');
+    }
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.delete('dp');
+    setSearchParams(nextParams, { replace: true });
+  }, [searchParams, dataPoints, setCurrentIndex, setSearchParams, setViewMode]);
 
   if (accessDenied) {
     return (
@@ -386,8 +558,8 @@ const DataLabelingWorkspace = () => {
                 <Target className="w-5 h-5 text-white" />
               </div>
               <div>
-                <h1 className="text-xl font-semibold text-foreground">Access Denied</h1>
-                <p className="text-sm text-muted-foreground">You are not assigned to this project.</p>
+                <h1 className="text-xl font-semibold text-foreground">{t("workspace.accessDenied")}</h1>
+                <p className="text-sm text-muted-foreground">{t("workspace.notAssigned")}</p>
               </div>
             </div>
             <ThemeToggle />
@@ -395,11 +567,11 @@ const DataLabelingWorkspace = () => {
           </div>
           <Card className="p-6">
             <p className="text-sm text-muted-foreground">
-              Ask an admin or project manager to grant you access.
+              {t("workspace.askAdmin")}
             </p>
             <div className="mt-4 flex gap-2">
               <Button variant="outline" onClick={() => navigate('/')}>
-                Back to Dashboard
+                {t("workspace.backToDashboard")}
               </Button>
             </div>
           </Card>
@@ -428,17 +600,18 @@ const DataLabelingWorkspace = () => {
     }
   }, [projectId, selectedModels.length]);
 
-  // Load annotation config on mount (from localStorage or default)
+  // Load annotation config — priority: project.xmlConfig → localStorage → default
   useEffect(() => {
-    const savedXml = projectId ? localStorage.getItem(`databayt-annotation-config-xml-${projectId}`) : null;
-    if (savedXml) {
-      setXmlEditorContent(savedXml);
+    const xmlSource = projectAccess?.xmlConfig
+      || (projectId ? localStorage.getItem(`databayt-annotation-config-xml-${projectId}`) : null);
+
+    if (xmlSource) {
       try {
-        const config = parseAnnotationConfigXML(savedXml);
+        const config = parseAnnotationConfigXML(xmlSource);
         setAnnotationConfig(config);
-        return; // Use saved config
+        return;
       } catch (err) {
-        console.error('Failed to parse saved annotation config, loading default:', err);
+        console.error('Failed to parse annotation config, loading default:', err);
       }
     }
 
@@ -446,7 +619,6 @@ const DataLabelingWorkspace = () => {
     fetch('/default-annotation-config.xml')
       .then(res => res.text())
       .then(xmlString => {
-        setXmlEditorContent(xmlString);
         try {
           const config = parseAnnotationConfigXML(xmlString);
           setAnnotationConfig(config);
@@ -455,24 +627,7 @@ const DataLabelingWorkspace = () => {
         }
       })
       .catch(err => console.error('Failed to load default annotation config:', err));
-  }, []);
-
-  // Handle custom XML config upload
-  const handleXmlConfigUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
-    try {
-      const xmlString = await file.text();
-      setXmlEditorContent(xmlString);
-      const config = parseAnnotationConfigXML(xmlString);
-      setAnnotationConfig(config);
-      setAnnotationFieldValuesMap({}); // Reset field values for all data points
-    } catch (err) {
-      setUploadError(`Failed to parse XML config: ${err instanceof Error ? err.message : 'Unknown error'}`);
-    }
-    event.target.value = '';
-  };
+  }, [projectAccess?.xmlConfig]);
 
   // Handle annotation field value change (per data point)
   const handleAnnotationFieldChange = (fieldId: string, value: string | boolean) => {
@@ -484,29 +639,6 @@ const DataLabelingWorkspace = () => {
         [fieldId]: value
       }
     }));
-  };
-
-  // Open XML editor
-  const openXmlEditor = () => {
-    setShowXmlEditor(true);
-  };
-
-  // Apply XML from editor
-  const applyXmlConfig = () => {
-    try {
-      const config = parseAnnotationConfigXML(xmlEditorContent);
-      setAnnotationConfig(config);
-      setAnnotationFieldValuesMap({});
-      if (projectId) localStorage.setItem(`databayt-annotation-config-xml-${projectId}`, xmlEditorContent);
-      setShowXmlEditor(false);
-    } catch (err) {
-      setUploadError(`Invalid XML: ${err instanceof Error ? err.message : 'Unknown error'}`);
-    }
-  };
-
-  // Insert column reference into XML editor
-  const insertColumnToXml = (columnName: string) => {
-    setXmlEditorContent(prev => prev + `{{${columnName}}}`);
   };
 
   // Initialize HF dataset name when project name loads
@@ -541,14 +673,243 @@ const DataLabelingWorkspace = () => {
     return Math.round((totalCompleted / annotationStats.sessionTime) * 3600); // per hour
   };
 
+  const formatCommentTime = useCallback((timestamp: number) => {
+    return new Intl.DateTimeFormat(undefined, {
+      dateStyle: 'medium',
+      timeStyle: 'short'
+    }).format(new Date(timestamp));
+  }, []);
+
+  const canEditComment = useCallback((comment: DataPointComment) => {
+    if (!currentUser) return false;
+    return comment.authorId === currentUser.id;
+  }, [currentUser]);
+
+  const canDeleteComment = useCallback((comment: DataPointComment) => {
+    if (!currentUser) return false;
+    if (comment.authorId === currentUser.id) return true;
+    if (isAdmin) return true;
+    if (isManagerForProject) return true;
+    return false;
+  }, [currentUser, isAdmin, isManagerForProject]);
+
+  const currentDataPointId = currentDataPoint?.id;
+
+  const loadComments = useCallback(async (pageNumber: number = 1) => {
+    if (!projectId || !currentDataPointId) {
+      setComments([]);
+      setCommentsPage(1);
+      setCommentsTotalPages(1);
+      return;
+    }
+
+    setCommentsLoading(true);
+    try {
+      const response = await projectService.getComments(projectId, currentDataPointId, pageNumber, COMMENTS_PAGE_SIZE);
+      setComments(response.comments);
+      setCommentsPage(response.pagination?.page || pageNumber);
+      setCommentsTotalPages(Math.max(1, response.pagination?.totalPages || 1));
+    } catch (error) {
+      console.error("Failed to load comments:", error);
+      setComments([]);
+      setCommentsPage(1);
+      setCommentsTotalPages(1);
+    } finally {
+      setCommentsLoading(false);
+    }
+  }, [projectId, currentDataPointId]);
+
+  useEffect(() => {
+    setCommentDraft('');
+    setEditingCommentId(null);
+    setEditingCommentBody('');
+    loadComments(1);
+  }, [loadComments]);
+
+  const handleCreateComment = async () => {
+    if (!projectId || !currentDataPoint) return;
+    const trimmed = commentDraft.trim();
+    if (!trimmed) return;
+
+    try {
+      await projectService.createComment(projectId, currentDataPoint.id, trimmed);
+      setCommentDraft('');
+      await loadComments(1);
+    } catch (error) {
+      console.error("Failed to create comment:", error);
+      toast({
+        title: "Failed to add comment",
+        description: error instanceof Error ? error.message : "Could not add comment.",
+        variant: "destructive"
+      });
+    }
+  };
+
+  const startEditComment = (comment: DataPointComment) => {
+    setEditingCommentId(comment.id);
+    setEditingCommentBody(comment.body);
+  };
+
+  const cancelEditComment = () => {
+    setEditingCommentId(null);
+    setEditingCommentBody('');
+  };
+
+  const handleUpdateComment = async (commentId: string) => {
+    if (!projectId) return;
+    const trimmed = editingCommentBody.trim();
+    if (!trimmed) return;
+
+    try {
+      await projectService.updateComment(projectId, commentId, trimmed);
+      setEditingCommentId(null);
+      setEditingCommentBody('');
+      await loadComments(commentsPage);
+    } catch (error) {
+      console.error("Failed to update comment:", error);
+      toast({
+        title: "Failed to update comment",
+        description: error instanceof Error ? error.message : "Could not update comment.",
+        variant: "destructive"
+      });
+    }
+  };
+
+  const handleDeleteComment = async (commentId: string) => {
+    if (!projectId) return;
+    const remainingAfterLocalDelete = Math.max(0, comments.length - 1);
+    const nextPage = remainingAfterLocalDelete === 0 && commentsPage > 1 ? commentsPage - 1 : commentsPage;
+
+    // Frontend hard-delete behavior: remove from current UI list immediately.
+    setComments(prev => prev.filter(comment => comment.id !== commentId));
+    if (editingCommentId === commentId) {
+      cancelEditComment();
+    }
+
+    try {
+      await projectService.deleteComment(projectId, commentId);
+      await loadComments(nextPage);
+    } catch (error) {
+      console.error("Failed to delete comment:", error);
+      await loadComments(commentsPage);
+      toast({
+        title: "Failed to delete comment",
+        description: error instanceof Error ? error.message : "Could not delete comment.",
+        variant: "destructive"
+      });
+    }
+  };
+
+  const getAssignmentForCurrentUser = useCallback((dataPoint: DataPoint) => {
+    if (!currentUser) return undefined;
+    return dataPoint.assignments?.find(a => a.annotatorId === currentUser.id);
+  }, [currentUser]);
+
+
+  const getVisibleFinalAnnotation = useCallback((dataPoint?: DataPoint) => {
+    if (!dataPoint) return '';
+    if (isAnnotatorForProject) {
+      const assignment = getAssignmentForCurrentUser(dataPoint);
+      return assignment?.value || '';
+    }
+    if (dataPoint.assignments && dataPoint.assignments.length > 0) {
+      const values = dataPoint.assignments
+        .map(assignment => {
+          const value = assignment.value?.trim();
+          if (!value) return null;
+          const user = getUserById(assignment.annotatorId);
+          const name = user?.username || assignment.annotatorId;
+          return `${name}: ${value}`;
+        })
+        .filter((value): value is string => !!value);
+      if (values.length > 0) {
+        return values.join('\n');
+      }
+    }
+    return dataPoint.finalAnnotation || '';
+  }, [getAssignmentForCurrentUser, getUserById, isAnnotatorForProject]);
+
+  const getVisibleDraftAnnotation = useCallback((dataPoint?: DataPoint) => {
+    if (!dataPoint) return '';
+    if (isAnnotatorForProject && currentUser) {
+      return dataPoint.annotationDrafts?.[currentUser.id] || '';
+    }
+    return dataPoint.humanAnnotation || '';
+  }, [currentUser, isAnnotatorForProject]);
+
+  const getIaaRequiredCount = useCallback((dataPoint?: DataPoint) => {
+    if (!dataPoint?.isIAA) return 1;
+    return Math.max(2, Math.floor(dataPoint.iaaRequiredCount ?? projectAccess?.iaaConfig?.annotatorsPerIAAItem ?? 2));
+  }, [projectAccess?.iaaConfig?.annotatorsPerIAAItem]);
+
+  const getDoneCount = useCallback((dataPoint?: DataPoint) => {
+    if (!dataPoint) return 0;
+    const doneAssignments = (dataPoint.assignments || []).filter(a => a.status === 'done' && (a.value ?? '').trim().length > 0);
+    if (doneAssignments.length > 0) return doneAssignments.length;
+    if ((dataPoint.finalAnnotation || '').trim().length > 0) return 1;
+    return 0;
+  }, []);
+
+  const getPrimaryAnnotatorName = useCallback((dataPoint?: DataPoint) => {
+    if (!dataPoint?.assignments || dataPoint.assignments.length === 0) return '';
+    const done = dataPoint.assignments.find(a => a.status === 'done' && (a.value ?? '').trim().length > 0);
+    if (!done) return '';
+    const user = getUserById(done.annotatorId);
+    return user?.username || done.annotatorId;
+  }, [getUserById]);
+
+  const getDoneAnnotatorNames = useCallback((dataPoint?: DataPoint) => {
+    if (!dataPoint?.assignments || dataPoint.assignments.length === 0) return [];
+    const names = dataPoint.assignments
+      .filter(a => a.status === 'done' && (a.value ?? '').trim().length > 0)
+      .map(a => {
+        const user = getUserById(a.annotatorId);
+        return user?.username || a.annotatorId;
+      });
+    return Array.from(new Set(names));
+  }, [getUserById]);
+
+  const isCompleteByRequirement = useCallback((dataPoint?: DataPoint) => {
+    if (!dataPoint) return false;
+    return getDoneCount(dataPoint) >= getIaaRequiredCount(dataPoint);
+  }, [getDoneCount, getIaaRequiredCount]);
+
+  const getDisplayStatus = useCallback((dataPoint: DataPoint) => {
+    if (isAnnotatorForProject) {
+      const assignment = getAssignmentForCurrentUser(dataPoint);
+      if (assignment?.status === 'done') {
+        return { code: 'accepted' as const, label: t('workspace.statusDone') };
+      }
+      if (!dataPoint.isIAA && getDoneCount(dataPoint) > 0) {
+        return { code: 'accepted' as const, label: t('workspace.statusDone') };
+      }
+      return { code: 'pending' as const, label: t('workspace.statusPending') };
+    }
+    const complete = isCompleteByRequirement(dataPoint);
+    return complete
+      ? { code: 'accepted' as const, label: t('workspace.statusDone') }
+      : { code: 'pending' as const, label: t('workspace.statusPending') };
+  }, [getAssignmentForCurrentUser, getDoneCount, isAnnotatorForProject, isCompleteByRequirement, t]);
+
+  const getStatusVariant = (statusCode: DataPoint['status']) => {
+    if (statusCode === 'accepted') return 'default';
+    if (statusCode === 'edited') return 'secondary';
+    if (statusCode === 'ai_processed') return 'outline';
+    if (statusCode === 'partial') return 'outline';
+    if (statusCode === 'needs_adjudication') return 'destructive';
+    return 'destructive';
+  };
+
   const getAnnotationPreview = (dataPoint: DataPoint) => {
-    if (dataPoint.finalAnnotation) return { label: 'Final', text: dataPoint.finalAnnotation };
-    if (dataPoint.humanAnnotation) return { label: 'Human', text: dataPoint.humanAnnotation };
-    if (dataPoint.originalAnnotation) return { label: 'Original', text: dataPoint.originalAnnotation };
-    if (dataPoint.customField) return { label: dataPoint.customFieldName || 'Custom', text: dataPoint.customField };
+    const visibleFinal = getVisibleFinalAnnotation(dataPoint);
+    const visibleDraft = getVisibleDraftAnnotation(dataPoint);
+    if (visibleFinal) return { label: t('workspace.annotationFinal'), text: visibleFinal };
+    if (visibleDraft) return { label: t('workspace.annotationHuman'), text: visibleDraft };
+    if (dataPoint.originalAnnotation) return { label: t('workspace.annotationOriginal'), text: dataPoint.originalAnnotation };
+    if (dataPoint.customField) return { label: dataPoint.customFieldName || t('workspace.annotationCustom'), text: dataPoint.customField };
     const aiSuggestion = Object.values(dataPoint.aiSuggestions || {})[0];
-    if (aiSuggestion) return { label: 'AI', text: aiSuggestion };
-    return { label: 'None', text: '' };
+    if (aiSuggestion) return { label: t('workspace.annotationAI'), text: aiSuggestion };
+    return { label: t('workspace.annotationNone'), text: '' };
   };
 
   // Handle starting a new task
@@ -598,11 +959,11 @@ const DataLabelingWorkspace = () => {
     const extension = lastDotIndex >= 0 ? file.name.slice(lastDotIndex).toLowerCase() : '';
 
     if (!extension) {
-      return 'File must have an extension (.json, .csv, or .txt).';
+      return 'File must have an extension (.json, .csv, .txt, .mp3, .wav, or .m4a).';
     }
 
     if (!allowedDataFileExtensions.includes(extension)) {
-      return `Unsupported file type "${extension}". Please upload a JSON, CSV, or TXT file.`;
+      return `Unsupported file type "${extension}". Please upload a JSON, CSV, TXT, MP3, WAV, or M4A file.`;
     }
 
     if (file.size === 0) {
@@ -621,6 +982,229 @@ const DataLabelingWorkspace = () => {
       seen.set(key, count + 1);
       return count === 0 ? baseName : `${baseName}_${count + 1}`;
     });
+  };
+
+  const toDisplayString = (value: unknown): string => {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  };
+
+  const toBase64FromByteArray = (bytes: number[]) => {
+    const chunkSize = 0x8000;
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const chunk = bytes.slice(i, i + chunkSize);
+      binary += String.fromCharCode(...chunk);
+    }
+    return btoa(binary);
+  };
+
+  const resolveImportedAudioContent = (value: unknown, datasetId?: string): string | null => {
+    const resolvePathToHubUrl = (pathValue: string) => {
+      const trimmed = pathValue.trim();
+      if (!trimmed) return null;
+      if (/^https?:\/\//i.test(trimmed)) return trimmed;
+      if (!datasetId) return trimmed;
+      const cleanPath = trimmed.replace(/^\/+/, '').split('/').map(segment => encodeURIComponent(segment)).join('/');
+      return `https://huggingface.co/datasets/${encodeURIComponent(datasetId)}/resolve/main/${cleanPath}`;
+    };
+
+    if (!value) return null;
+
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        const resolved = resolveImportedAudioContent(entry, datasetId);
+        if (resolved) return resolved;
+      }
+      return null;
+    }
+
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (!trimmed) return null;
+      if (trimmed.startsWith('data:audio/')) return trimmed;
+      if (/^https?:\/\//i.test(trimmed)) return trimmed;
+      if (/\.(mp3|wav|m4a|ogg|flac)(\?.*)?$/i.test(trimmed)) {
+        return resolvePathToHubUrl(trimmed);
+      }
+      return null;
+    }
+
+    if (typeof value === 'object') {
+      const audioObject = value as Record<string, unknown>;
+      if (typeof audioObject.src === 'string') {
+        const content = resolveImportedAudioContent(audioObject.src, datasetId);
+        if (content) return content;
+      }
+      if (typeof audioObject.content === 'string') {
+        const content = resolveImportedAudioContent(audioObject.content, datasetId);
+        if (content) return content;
+      }
+      if (typeof audioObject.url === 'string') {
+        const content = resolveImportedAudioContent(audioObject.url, datasetId);
+        if (content) return content;
+      }
+      if (typeof audioObject.path === 'string') {
+        const resolved = resolvePathToHubUrl(audioObject.path);
+        if (resolved) return resolved;
+      }
+      if (typeof audioObject.bytes === 'string') {
+        if (audioObject.bytes.startsWith('data:audio/')) return audioObject.bytes;
+        return `data:audio/wav;base64,${audioObject.bytes}`;
+      }
+      if (Array.isArray(audioObject.bytes) && audioObject.bytes.every((entry) => typeof entry === 'number')) {
+        return `data:audio/wav;base64,${toBase64FromByteArray(audioObject.bytes as number[])}`;
+      }
+    }
+
+    return null;
+  };
+
+  const inferDataPointType = (content: string, explicitType?: unknown): DataPoint['type'] => {
+    if (explicitType === 'image' || explicitType === 'audio' || explicitType === 'text') {
+      return explicitType;
+    }
+    const lowerContent = content.toLowerCase();
+    if (
+      lowerContent.startsWith('data:audio/')
+      || /\.(mp3|wav|m4a)(\?.*)?$/.test(lowerContent)
+    ) {
+      return 'audio';
+    }
+    return 'text';
+  };
+
+  const getPlayableAudioSource = (value: unknown): string | null => {
+    const resolved = resolveImportedAudioContent(value, hfImportDataset);
+    if (resolved) return resolved;
+
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if ((trimmed.startsWith('{') || trimmed.startsWith('['))) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          return resolveImportedAudioContent(parsed, hfImportDataset);
+        } catch {
+          return null;
+        }
+      }
+    }
+
+    return null;
+  };
+
+  const toMetadataRecord = (row: Record<string, unknown>) => {
+    const metadata: Record<string, string> = {};
+    Object.entries(row).forEach(([key, value]) => {
+      metadata[key] = toDisplayString(value);
+    });
+    return metadata;
+  };
+
+  const toDisplayMetadataRecord = (
+    metadata: Record<string, string>,
+    contentColumn?: string
+  ) => {
+    const resolvedContentColumn = contentColumn || selectedContentColumn;
+    const selectedColumns = selectedDisplayColumns.filter(
+      (column) => column && column !== resolvedContentColumn
+    );
+    if (selectedColumns.length === 0) return {};
+
+    const displayMetadata: Record<string, string> = {};
+    selectedColumns.forEach((column) => {
+      if (Object.prototype.hasOwnProperty.call(metadata, column)) {
+        displayMetadata[column] = metadata[column];
+      }
+    });
+    return displayMetadata;
+  };
+
+  const resolveContentColumn = (columns: string[]) => {
+    if (selectedContentColumn && columns.includes(selectedContentColumn)) {
+      return selectedContentColumn;
+    }
+    const contentCandidates = ['text', 'content', 'audio', 'path', 'url', 'sentence', 'question', 'instruction', 'input', 'prompt'];
+    const found = columns.find(col => contentCandidates.some(candidate => col.toLowerCase().includes(candidate)));
+    if (found) return found;
+    return columns.find(col => col.toLowerCase() !== 'id') || columns[0] || '';
+  };
+
+  const resolveAnnotationColumn = (columns: string[]) => {
+    const annotationCandidates = ['label', 'annotation', 'target', 'output', 'answer', 'response'];
+    return columns.find(col => annotationCandidates.some(candidate => col.toLowerCase().includes(candidate)));
+  };
+
+  const handleImportFromHuggingFace = async () => {
+    if (!canUpload) {
+      toast({
+        title: 'Permission denied',
+        description: 'Only managers or admins can import datasets.'
+      });
+      return;
+    }
+
+    const dataset = hfImportDataset.trim();
+    if (!dataset) {
+      setUploadError('Please enter a Hugging Face dataset id (e.g. username/dataset_name).');
+      return;
+    }
+
+    setIsImportingHF(true);
+    setUploadError(null);
+
+    try {
+      const response = await apiClient.huggingFace.importDataset({
+        dataset,
+        config: hfImportConfig.trim() || undefined,
+        split: hfImportSplit.trim() || undefined,
+        maxRows: hfImportMaxRows === "" ? undefined : hfImportMaxRows
+      });
+
+      if (!Array.isArray(response.rows) || response.rows.length === 0) {
+        throw new Error('No rows returned from this dataset/split.');
+      }
+
+      const columns = response.columns || [];
+      const resolvedContent = resolveContentColumn(columns);
+
+      setPendingFile(null);
+      setPendingHFRows(response.rows);
+      setAvailableColumns(columns);
+      setSelectedContentColumn(resolvedContent);
+      setSelectedDisplayColumns(columns.filter(col => col !== resolvedContent).slice(0, 3));
+      setUploadPrompt('');
+      setCustomFieldName('');
+
+      setHfImportConfig(response.config || hfImportConfig);
+      setHfImportSplit(response.split || hfImportSplit);
+      if (response.totalRows && response.totalRows > 0) {
+        setHfImportMaxRows(response.totalRows);
+      }
+      setShowHFImportDialog(false);
+      setShowUploadPrompt(true);
+
+      toast({
+        title: 'Dataset loaded',
+        description: `Imported ${response.rowCount} rows from ${response.dataset} (${response.split}).`
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown import error';
+      setUploadError(`Hugging Face import failed: ${message}`);
+      toast({
+        title: 'Import failed',
+        description: message,
+        variant: 'destructive'
+      });
+    } finally {
+      setIsImportingHF(false);
+    }
   };
 
   // File upload handler - now shows prompt dialog first
@@ -647,7 +1231,7 @@ const DataLabelingWorkspace = () => {
         title: 'Invalid file',
         description: validationError,
         variant: 'destructive',
-        duration: 20000
+        duration: 7000
       });
       setPendingFile(null);
       event.target.value = '';
@@ -656,15 +1240,17 @@ const DataLabelingWorkspace = () => {
 
     console.log('File selected:', file.name, file.type, file.size);
 
+    const lowerFileName = file.name.toLowerCase();
+
     // Pre-parse headers/keys to show variable suggestions
-    if (file.name.endsWith('.csv')) {
+    if (lowerFileName.endsWith('.csv')) {
       const text = await file.text();
       const firstLine = text.split('\n')[0];
       if (firstLine) {
         const headers = normalizeCsvHeader(firstLine.split(','));
         setAvailableColumns(headers);
       }
-    } else if (file.name.endsWith('.json')) {
+    } else if (lowerFileName.endsWith('.json')) {
       const text = await file.text();
       try {
         const jsonData = JSON.parse(text);
@@ -684,6 +1270,7 @@ const DataLabelingWorkspace = () => {
     }
 
     // Store the file and show prompt dialog
+    setPendingHFRows(null);
     setPendingFile(file);
     setUploadPrompt('');
     setCustomFieldName('');
@@ -694,16 +1281,137 @@ const DataLabelingWorkspace = () => {
   };
 
   // Process the file after prompt is confirmed
-  const processFileUpload = async (file: File, prompt: string, customField: string) => {
+  const hashStringToSeed = (value: string) => {
+    let hash = 0;
+    for (let i = 0; i < value.length; i += 1) {
+      hash = (hash << 5) - hash + value.charCodeAt(i);
+      hash |= 0;
+    }
+    return Math.abs(hash);
+  };
+
+  const mulberry32 = (seed: number) => {
+    let t = seed;
+    return () => {
+      t += 0x6D2B79F5;
+      let r = Math.imul(t ^ (t >>> 15), t | 1);
+      r ^= r + Math.imul(r ^ (r >>> 7), r | 61);
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    };
+  };
+
+  const shuffleWithRng = <T,>(items: T[], rng: () => number) => {
+    const arr = [...items];
+    for (let i = arr.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(rng() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  };
+
+  const applyAssignmentsToDataPoints = (points: DataPoint[]) => {
+    const config = projectAccess?.iaaConfig;
+    const enabled = !!config?.enabled && (config.portionPercent ?? 0) > 0;
+    const portion = Math.max(0, Math.min(100, Math.floor(config?.portionPercent ?? 0)));
+    const annotatorsPerItem = Math.max(2, Math.floor(config?.annotatorsPerIAAItem ?? 2));
+    const seedBase = (config?.seed ?? 0) + hashStringToSeed(projectId ?? '');
+    const rng = mulberry32(seedBase);
+
+    const total = points.length;
+    const iaaCount = enabled ? Math.min(total, Math.ceil((total * portion) / 100)) : 0;
+    const indices = shuffleWithRng(Array.from({ length: total }, (_, i) => i), rng);
+    const iaaSet = new Set(indices.slice(0, iaaCount));
+
+    return points.map((dp, index) => {
+      const isIAA = enabled && iaaSet.has(index);
+      return {
+        ...dp,
+        isIAA,
+        iaaRequiredCount: isIAA ? annotatorsPerItem : 1,
+        assignments: [],
+        status: 'pending' as const,
+        finalAnnotation: '',
+        humanAnnotation: '',
+        annotationDrafts: {}
+      };
+    });
+  };
+
+  const processFileUpload = async (file: File | null, prompt: string, customField: string, importedRows?: Array<Record<string, unknown>>) => {
     setIsUploading(true);
     setShowUploadPrompt(false);
 
     try {
-      const text = await file.text();
+      const lastDotIndex = file?.name.lastIndexOf('.') ?? -1;
+      const extension = lastDotIndex >= 0 ? file!.name.slice(lastDotIndex).toLowerCase() : '';
+      const text = importedRows || audioFileExtensions.includes(extension) ? '' : await file!.text();
       let parsedData: DataPoint[] = [];
 
-      // Handle different file formats
-      if (file.name.endsWith('.json')) {
+      if (file && audioFileExtensions.includes(extension)) {
+        const audioDataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result || ''));
+          reader.onerror = () => reject(new Error('Failed to read audio file.'));
+          reader.readAsDataURL(file);
+        });
+        parsedData = [{
+          id: generateId(),
+          content: audioDataUrl,
+          type: 'audio',
+          originalAnnotation: '',
+          aiSuggestions: {},
+          ratings: {},
+          status: 'pending' as const,
+          uploadPrompt: prompt,
+          customField: '',
+          customFieldName: customField,
+          metadata: {
+            filename: file.name,
+            mimeType: file.type || 'audio/*',
+            fileSize: `${file.size}`
+          },
+          displayMetadata: {},
+          customFieldValues: {},
+          isIAA: false,
+          annotatedAt: Date.now(),
+        }];
+      } else if (importedRows && importedRows.length > 0) {
+        const columns = Object.keys(importedRows[0] || {});
+        const contentColumn = resolveContentColumn(columns);
+        const annotationColumn = resolveAnnotationColumn(columns);
+
+        if (annotationColumn) {
+          setAnnotationLabel(annotationColumn);
+        } else {
+          setAnnotationLabel(t('workspace.originalAnnotation'));
+        }
+
+        parsedData = importedRows.map((row) => {
+          const metadata = toMetadataRecord(row);
+          const rawContent = row[contentColumn];
+          const resolvedAudioContent = resolveImportedAudioContent(rawContent, hfImportDataset)
+            || resolveImportedAudioContent(row['audio'], hfImportDataset)
+            || resolveImportedAudioContent(row['content'], hfImportDataset);
+          const content = resolvedAudioContent || toDisplayString(rawContent) || JSON.stringify(row);
+          return {
+          id: generateId(),
+          content,
+          type: inferDataPointType(content, row['type'] || (resolvedAudioContent ? 'audio' : undefined)),
+          originalAnnotation: annotationColumn ? toDisplayString(row[annotationColumn]) : '',
+          aiSuggestions: {},
+          ratings: {},
+          status: 'pending' as const,
+          uploadPrompt: prompt,
+          customField: '',
+          customFieldName: customField,
+          metadata,
+          displayMetadata: toDisplayMetadataRecord(metadata, contentColumn),
+          customFieldValues: {},
+          isIAA: false,
+          annotatedAt: Date.now(),
+        } as DataPoint;
+      });
+      } else if (file && extension === '.json') {
         let jsonData: unknown;
         try {
           jsonData = JSON.parse(text);
@@ -721,10 +1429,16 @@ const DataLabelingWorkspace = () => {
             if (firstItem.prompt) setPromptLabel('Prompt');
           }
 
-          parsedData = jsonData.map((item: any, index: number) => ({
-            id: crypto.randomUUID(),
-            content: typeof item === 'string' ? item : item.text || item.content || JSON.stringify(item),
-            type: item.type || 'text',
+          parsedData = jsonData.map((item: any) => {
+            const metadata = Object.entries(item).reduce((acc, [key, value]) => {
+              acc[key] = String(value);
+              return acc;
+            }, {} as Record<string, string>);
+            const content = typeof item === 'string' ? item : item.text || item.content || JSON.stringify(item);
+            return {
+            id: generateId(),
+            content,
+            type: inferDataPointType(content, item.type),
             originalAnnotation: item.annotation || item.label || '',
             aiSuggestions: {},
             ratings: {},
@@ -732,15 +1446,14 @@ const DataLabelingWorkspace = () => {
             uploadPrompt: prompt || item.prompt, // Use item prompt if available
             customField: '',
             customFieldName: customField,
-            metadata: Object.entries(item).reduce((acc, [key, value]) => {
-              acc[key] = String(value);
-              return acc;
-            }, {} as Record<string, string>)
-          }));
+            metadata,
+            displayMetadata: toDisplayMetadataRecord(metadata)
+          };
+        });
         } else {
           throw new Error('JSON file must contain an array of data points');
         }
-      } else if (file.name.endsWith('.csv')) {
+      } else if (file && extension === '.csv') {
         const lines = text.split('\n').filter(line => line.trim());
         if (lines.length === 0) {
           throw new Error('CSV file is empty.');
@@ -777,53 +1490,69 @@ const DataLabelingWorkspace = () => {
         const promptIndex = header.findIndex(h => h.toLowerCase().includes('prompt'));
         if (promptIndex >= 0) setPromptLabel(header[promptIndex]);
 
+        // Regex to split by comma but ignore commas inside quotes
+        const regex = /,(?=(?:(?:[^"]*"){2})*[^"]*$)/;
+
         parsedData = lines.slice(1).map((line, index) => {
-          // Handle simple CSV parsing (split by comma)
-          // TODO: Consider using a library like PapaParse for robust CSV handling
-          const values = line.split(',');
+          if (!line.trim()) return null; // Skip empty lines
+
+          // Handle quotes: remove surrounding quotes if present and unescape double quotes
+          const values = line.split(regex).map(val => {
+            let v = val.trim();
+            if (v.startsWith('"') && v.endsWith('"')) {
+              v = v.slice(1, -1).replace(/""/g, '"');
+            }
+            return v;
+          });
+
           if (values.length > header.length) {
-            throw new Error(`CSV row ${index + 2} has ${values.length} columns, expected ${header.length}.`);
+            // Try to recover if trailing empty commas
+            const meaningfulValues = values.filter(v => v !== '');
+            if (meaningfulValues.length <= header.length) {
+              // Pad with empty strings if needed or just use as is
+            } else {
+              console.warn(`Row ${index + 2} has more columns than header`, values);
+            }
           }
+
+          // Pad if missing columns
           while (values.length < header.length) {
             values.push('');
           }
-          if (!values[contentIndex] || !values[contentIndex].trim()) {
-            throw new Error(`CSV row ${index + 2} is missing a value for column "${header[contentIndex]}".`);
+
+          if (!values[contentIndex] && values[contentIndex] !== '') {
+            // Allow empty content? Maybe not. But let's be lenient for now or fallback.
+            // Actually if content is critical we should probably check.
+            // But let's just use what we have.
           }
 
-          // Create metadata object - only include selected display columns if specified
+          // Create metadata object
           const metadata: Record<string, string> = {};
           header.forEach((h, i) => {
             if (values[i] !== undefined) {
-              // Include all columns in metadata, but mark which ones to display
-              metadata[h] = values[i].trim();
+              metadata[h] = values[i];
             }
           });
 
-          // Filter display metadata to only selected columns
-          const displayMetadata: Record<string, string> = {};
-          if (selectedDisplayColumns.length > 0) {
-            selectedDisplayColumns.forEach(col => {
-              if (metadata[col] !== undefined) {
-                displayMetadata[col] = metadata[col];
-              }
-            });
-          }
-
+          const content = contentIndex >= 0 ? values[contentIndex] : (values[0] || line);
           return {
-            id: crypto.randomUUID(),
-            content: contentIndex >= 0 ? values[contentIndex]?.trim() : (values[0]?.trim() || line),
-            originalAnnotation: annotationIndex >= 0 ? values[annotationIndex]?.trim() : '',
+            id: generateId(),
+            content,
+            type: inferDataPointType(content, metadata.type),
+            originalAnnotation: annotationIndex >= 0 ? values[annotationIndex] : '',
             aiSuggestions: {},
             ratings: {},
             status: 'pending' as const,
             uploadPrompt: prompt,
             customField: '',
             customFieldName: customField,
-            metadata: metadata,
-            displayMetadata: selectedDisplayColumns.length > 0 ? displayMetadata : metadata
-          };
-        });
+            metadata,
+            displayMetadata: toDisplayMetadataRecord(metadata, header[contentIndex]),
+            customFieldValues: {},
+            isIAA: false, // Default, will be set by applyAssignmentsToDataPoints
+            annotatedAt: Date.now(), // timestamp for upload
+          } as DataPoint;
+        }).filter(Boolean) as DataPoint[];
       } else {
         // Plain text - each line is a data point
         const lines = text.split('\n').filter(line => line.trim());
@@ -831,7 +1560,7 @@ const DataLabelingWorkspace = () => {
           throw new Error('TXT file is empty.');
         }
         parsedData = lines.map((line, index) => ({
-          id: crypto.randomUUID(),
+          id: generateId(),
           content: line.trim(),
           status: 'pending' as const,
           aiSuggestions: {},
@@ -842,8 +1571,17 @@ const DataLabelingWorkspace = () => {
         }));
       }
 
-      loadNewData(parsedData);
-      await logProjectAction('upload', `File: ${file.name}, Items: ${parsedData.length}`);
+      const assignedData = applyAssignmentsToDataPoints(parsedData);
+      loadNewData(assignedData);
+      setPendingHFRows(null);
+
+      // Persist newly uploaded data to backend
+      if (projectId) {
+        await projectService.saveProgress(projectId, assignedData, annotationStats);
+      }
+
+      const uploadSource = importedRows ? `HuggingFace: ${hfImportDataset}` : `File: ${file?.name ?? 'unknown'}`;
+      await logProjectAction('upload', `${uploadSource}, Items: ${parsedData.length}`);
     } catch (error) {
       const errorMessage = `Failed to parse file: ${error instanceof Error ? error.message : 'Unknown error'}`;
       setUploadError(errorMessage);
@@ -851,7 +1589,7 @@ const DataLabelingWorkspace = () => {
         title: 'File upload failed',
         description: errorMessage,
         variant: 'destructive',
-        duration: 20000
+        duration: 7000
       });
     } finally {
       setIsUploading(false);
@@ -892,22 +1630,41 @@ const DataLabelingWorkspace = () => {
     const { getAIProvider } = await import('@/services/aiProviders');
     const provider = getAIProvider(connection.providerId);
 
-    const promptSeed = dataPoint.uploadPrompt || profile.defaultPrompt || '';
+    const promptSeed = aiInstruction?.trim() || dataPoint.uploadPrompt || profile.defaultPrompt || '';
     const promptToUse = getInterpolatedPrompt(promptSeed, dataPoint.metadata);
 
-    const key = connection.apiKey?.trim() || '';
     const baseUrl = connection.baseUrl?.trim() || (connection.providerId === 'local' ? defaultLocalBaseUrl : undefined);
+
+    let annotationSchema: AnnotationSchema | undefined;
+    let finalPrompt = promptToUse;
+
+    if (annotationConfig && annotationConfig.fields.length > 0) {
+      annotationSchema = {
+        taskType: projectAccess?.taskType || 'custom',
+        fields: annotationConfig.fields.map(f => ({
+          name: f.id,
+          type: mapFieldConfigType(f.type),
+          options: f.options?.map(o => o.value),
+          required: f.required,
+        })),
+      };
+      finalPrompt = promptToUse
+        ? `${promptToUse}\n\n${buildSchemaPrompt(annotationSchema)}`
+        : buildSchemaPrompt(annotationSchema);
+    }
 
     return await provider.processText(
       dataPoint.content,
-      promptToUse,
-      key,
+      finalPrompt,
+      connection.id,
       profile.modelId,
       baseUrl,
       dataPoint.type,
       {
         temperature: profile.temperature,
-        maxTokens: profile.maxTokens
+        maxTokens: profile.maxTokens,
+        jwtToken: getAuthToken() ?? undefined,
+        annotationSchema,
       }
     );
   };
@@ -934,7 +1691,7 @@ const DataLabelingWorkspace = () => {
         setUploadError(`Connection for ${profile.displayName} is missing or inactive`);
         return null;
       }
-      if (providerRequirements.get(connection.providerId) && !connection.apiKey) {
+      if (providerRequirements.get(connection.providerId) && !connection.hasApiKey) {
         setUploadError(`Missing API key for ${connection.name}`);
         return null;
       }
@@ -1022,7 +1779,11 @@ const DataLabelingWorkspace = () => {
     const connection = profile ? connectionById.get(profile.providerConnectionId) : null;
     if (!connection || !profile) return null;
 
-    if (connection.providerId === 'openai' || connection.providerId === 'anthropic') {
+    if (
+      connection.providerId === 'openai'
+      || connection.providerId === 'anthropic'
+      || connection.providerId === 'gemini'
+    ) {
       const officialProviderPricing = officialProviderInputPricePerMillion[connection.providerId];
       const officialPrice = officialProviderPricing?.[profile.modelId as keyof typeof officialProviderPricing];
       if (officialPrice !== undefined) {
@@ -1195,7 +1956,7 @@ const DataLabelingWorkspace = () => {
             const updates = resultsById.get(dp.id);
             if (!updates) return dp;
             const aiSuggestions = { ...(dp.aiSuggestions || {}), ...updates };
-            const shouldUpdateStatus = dp.status !== 'accepted' && dp.status !== 'edited';
+            const shouldUpdateStatus = dp.status === 'pending' || dp.status === 'ai_processed' || dp.status === 'rejected';
             return {
               ...dp,
               aiSuggestions,
@@ -1242,7 +2003,7 @@ const DataLabelingWorkspace = () => {
         title: 'Batch Processing Failed',
         description: errorMessage,
         variant: 'destructive',
-        duration: 5000
+        duration: 7000
       });
     } finally {
       setIsProcessing(false);
@@ -1257,11 +2018,48 @@ const DataLabelingWorkspace = () => {
   // Annotation handlers
 
 
-  // Derived state for completed count
-  const completedCount = dataPoints.filter(dp => dp.status === 'accepted' || dp.status === 'edited').length;
-
   const normalizedAnnotationQuery = useMemo(() => annotationQuery.trim().toLowerCase(), [annotationQuery]);
-  const annotationEntries = useMemo(() => dataPoints.map((dataPoint, index) => ({ dataPoint, index })), [dataPoints]);
+  const annotationEntries = useMemo(() => {
+    return dataPoints.map((dataPoint, index) => ({ dataPoint, index }));
+  }, [dataPoints]);
+
+  const availableAnnotators = useMemo(() => {
+    const annotatorSet = new Map<string, string>();
+    annotationEntries.forEach(({ dataPoint }) => {
+      // From assignments
+      dataPoint.assignments?.forEach(a => {
+        if (a.status === 'done' || a.status === 'in_progress') {
+          const user = getUserById(a.annotatorId);
+          annotatorSet.set(a.annotatorId, user?.username || a.annotatorId);
+        }
+      });
+      // From top level fields
+      if (dataPoint.annotatorId) {
+        const user = getUserById(dataPoint.annotatorId);
+        annotatorSet.set(dataPoint.annotatorId, user?.username || dataPoint.annotatorName || dataPoint.annotatorId);
+      }
+    });
+
+    // Also include currently assigned annotators even if they haven't started
+    projectAccess?.annotatorIds?.forEach(id => {
+      const user = getUserById(id);
+      if (!annotatorSet.has(id)) {
+        annotatorSet.set(id, user?.username || id);
+      }
+    });
+
+    return Array.from(annotatorSet.entries()).map(([id, name]) => ({ id, name }));
+  }, [annotationEntries, getUserById, projectAccess]);
+
+  const globalCurrentRecordIndex = dataPoints.length > 0
+    ? ((page - 1) * pageSize) + currentIndex + 1
+    : 0;
+
+  const hasLocalOnlyFilters = useMemo(() => {
+    const hasMetadataFilter = Object.values(metadataFilters).some(values => values.length > 0);
+    return Boolean(normalizedAnnotationQuery) || hasMetadataFilter || annotatedByFilter !== 'all' || annotatedTimeFilter !== 'all';
+  }, [metadataFilters, normalizedAnnotationQuery, annotatedByFilter, annotatedTimeFilter]);
+
 
   const matchesMetadataFilters = (
     dataPoint: DataPoint,
@@ -1278,18 +2076,49 @@ const DataLabelingWorkspace = () => {
 
   const statusAndQueryFilteredEntries = useMemo(() => {
     return annotationEntries.filter(({ dataPoint }) => {
+      const displayStatus = getDisplayStatus(dataPoint);
       if (annotationStatusFilter === 'has_final') {
-        if (!dataPoint.finalAnnotation) return false;
-      } else if (annotationStatusFilter !== 'all' && dataPoint.status !== annotationStatusFilter) {
+        if (!getVisibleFinalAnnotation(dataPoint)) return false;
+      } else if (annotationStatusFilter !== 'all' && displayStatus.code !== annotationStatusFilter) {
         return false;
+      }
+
+      // Annotated By Filter
+      if (annotatedByFilter !== 'all') {
+        const itemAnnotators = new Set<string>();
+        if (dataPoint.annotatorId) itemAnnotators.add(dataPoint.annotatorId);
+        dataPoint.assignments?.forEach(a => {
+          if (a.status === 'done') itemAnnotators.add(a.annotatorId);
+        });
+        if (!itemAnnotators.has(annotatedByFilter)) return false;
+      }
+
+      // Annotated Time Filter
+      if (annotatedTimeFilter !== 'all') {
+        const now = Date.now();
+        const DayMs = 24 * 60 * 60 * 1000;
+        let threshold = 0;
+
+        if (annotatedTimeFilter === 'today') threshold = now - DayMs;
+        else if (annotatedTimeFilter === 'this_week') threshold = now - 7 * DayMs;
+        else if (annotatedTimeFilter === 'this_month') threshold = now - 30 * DayMs;
+
+        if (threshold > 0) {
+          const itemTimes = [dataPoint.annotatedAt].filter(Boolean) as number[];
+          dataPoint.assignments?.forEach(a => {
+            if (a.annotatedAt) itemTimes.push(a.annotatedAt);
+          });
+          const newest = itemTimes.length > 0 ? Math.max(...itemTimes) : 0;
+          if (newest < threshold) return false;
+        }
       }
 
       if (!normalizedAnnotationQuery) return true;
 
       const searchText = [
         dataPoint.content,
-        dataPoint.finalAnnotation,
-        dataPoint.humanAnnotation,
+        getVisibleFinalAnnotation(dataPoint),
+        getVisibleDraftAnnotation(dataPoint),
         dataPoint.originalAnnotation,
         dataPoint.customField,
         ...(dataPoint.metadata ? Object.values(dataPoint.metadata) : []),
@@ -1302,7 +2131,7 @@ const DataLabelingWorkspace = () => {
 
       return searchText.includes(normalizedAnnotationQuery);
     });
-  }, [annotationEntries, annotationStatusFilter, normalizedAnnotationQuery]);
+  }, [annotationEntries, annotationStatusFilter, annotatedByFilter, annotatedTimeFilter, normalizedAnnotationQuery, getDisplayStatus, getVisibleFinalAnnotation, getVisibleDraftAnnotation]);
 
   const eligibleMetadataKeys = useMemo(() => {
     const keyValues = annotationEntries.reduce((acc, { dataPoint }) => {
@@ -1357,6 +2186,18 @@ const DataLabelingWorkspace = () => {
     [filteredAnnotationEntries]
   );
 
+  const globalFilteredCount = useMemo(() => {
+    if (hasLocalOnlyFilters) return filteredAnnotationEntries.length;
+    if (annotationStatusFilter === 'all') return globalTotalItems;
+    if (annotationStatusFilter === 'has_final') return globalCompletedCount;
+    if (annotationStatusFilter === 'accepted') return statusCounts.accepted;
+    if (annotationStatusFilter === 'edited') return statusCounts.edited;
+    if (annotationStatusFilter === 'pending') return statusCounts.pending;
+    if (annotationStatusFilter === 'ai_processed') return statusCounts.aiProcessed;
+    if (annotationStatusFilter === 'rejected') return statusCounts.rejected;
+    return filteredAnnotationEntries.length;
+  }, [hasLocalOnlyFilters, filteredAnnotationEntries.length, annotationStatusFilter, globalTotalItems, globalCompletedCount, statusCounts]);
+
   useEffect(() => {
     if (metadataFilterOptions.length === 0 && Object.keys(metadataFilters).length === 0) return;
     setMetadataFilters(prev => {
@@ -1393,26 +2234,38 @@ const DataLabelingWorkspace = () => {
   );
 
   const hasActiveMetadataFilters = Object.values(metadataFilters).some(values => values?.length);
-  const hasActiveFilters = annotationStatusFilter !== 'all' || normalizedAnnotationQuery.length > 0 || hasActiveMetadataFilters;
+  const hasActiveFilters = annotationStatusFilter !== 'all' || annotatedByFilter !== 'all' || annotatedTimeFilter !== 'all' || normalizedAnnotationQuery.length > 0 || hasActiveMetadataFilters;
   const filteredNavigationIndices = useMemo(
     () => filteredAnnotationEntries.map(entry => entry.index),
     [filteredAnnotationEntries]
   );
   const pendingIndices = useMemo(
-    () => dataPoints.map((dp, index) => (dp.status === 'pending' ? index : -1)).filter(index => index >= 0),
-    [dataPoints]
+    () => annotationEntries.map(({ dataPoint, index }) => (getDisplayStatus(dataPoint).code === 'pending' ? index : -1)).filter(index => index >= 0),
+    [annotationEntries, getDisplayStatus]
   );
+
+  const currentAssignment = currentDataPoint ? getAssignmentForCurrentUser(currentDataPoint) : undefined;
+  const canAnnotateCurrent = !!currentDataPoint && (!isCompleteByRequirement(currentDataPoint) || !!currentAssignment);
+  const canCommentOnCurrent = !!currentUser && !!projectId && !!currentDataPoint;
+  const annotatorCanViewCompleted = !!currentDataPoint
+    && isCompleteByRequirement(currentDataPoint)
+    && (
+      !currentDataPoint.assignments
+      || currentDataPoint.assignments.length === 0
+      || getDoneCount(currentDataPoint) >= currentDataPoint.assignments.length
+    );
   const scopedPosition = useMemo(
     () => filteredNavigationIndices.indexOf(currentIndex),
     [filteredNavigationIndices, currentIndex]
   );
-  const scopedCanNavigate = useFilteredNavigation && filteredNavigationIndices.length > 0;
+  const effectiveUseFilteredNavigation = isAnnotatorForProject || useFilteredNavigation;
+  const scopedCanNavigate = effectiveUseFilteredNavigation && filteredNavigationIndices.length > 0;
   const scopedHasPrevious = scopedCanNavigate && (scopedPosition > 0 || scopedPosition === -1);
   const scopedHasNext = scopedCanNavigate && scopedPosition < filteredNavigationIndices.length - 1;
 
   useEffect(() => {
     setAnnotationPage(1);
-  }, [annotationQuery, annotationStatusFilter, annotationPageSize, metadataFilters]);
+  }, [annotationQuery, annotationStatusFilter, annotatedByFilter, annotatedTimeFilter, annotationPageSize, metadataFilters]);
 
   useEffect(() => {
     if (annotationPage !== safeAnnotationPage) {
@@ -1421,40 +2274,51 @@ const DataLabelingWorkspace = () => {
   }, [annotationPage, safeAnnotationPage]);
 
   useEffect(() => {
-    if (!hasActiveFilters && useFilteredNavigation) {
-      setUseFilteredNavigation(false);
+    if (!isAnnotatorForProject || !currentUser) return;
+    if (dataPoints.length === 0) return;
+    const current = dataPoints[currentIndex];
+    if (current) return;
+    const firstAssigned = annotationEntries[0]?.index;
+    if (firstAssigned !== undefined) {
+      setCurrentIndex(firstAssigned);
     }
-  }, [hasActiveFilters, useFilteredNavigation]);
+  }, [annotationEntries, currentIndex, currentUser, dataPoints, isAnnotatorForProject, setCurrentIndex]);
 
   useEffect(() => {
-    if (viewMode === 'record' && hasActiveFilters) {
+    if (!hasActiveFilters && useFilteredNavigation && !isAnnotatorForProject) {
+      setUseFilteredNavigation(false);
+    }
+  }, [hasActiveFilters, useFilteredNavigation, isAnnotatorForProject]);
+
+  useEffect(() => {
+    if (viewMode === 'record' && hasActiveFilters && !isAnnotatorForProject) {
       setUseFilteredNavigation(true);
     }
-  }, [viewMode, hasActiveFilters]);
+  }, [viewMode, hasActiveFilters, isAnnotatorForProject]);
 
   const navigatePrevious = useCallback(() => {
-    if (useFilteredNavigation && scopedPosition > 0) {
+    if (effectiveUseFilteredNavigation && scopedPosition > 0) {
       setCurrentIndex(filteredNavigationIndices[scopedPosition - 1]);
       return;
     }
-    if (useFilteredNavigation && scopedPosition === -1 && filteredNavigationIndices.length > 0) {
+    if (effectiveUseFilteredNavigation && scopedPosition === -1 && filteredNavigationIndices.length > 0) {
       setCurrentIndex(filteredNavigationIndices[0]);
       return;
     }
     handlePrevious();
-  }, [useFilteredNavigation, scopedPosition, filteredNavigationIndices, setCurrentIndex, handlePrevious]);
+  }, [effectiveUseFilteredNavigation, scopedPosition, filteredNavigationIndices, setCurrentIndex, handlePrevious]);
 
   const navigateNext = useCallback(() => {
-    if (useFilteredNavigation && scopedPosition >= 0 && scopedPosition < filteredNavigationIndices.length - 1) {
+    if (effectiveUseFilteredNavigation && scopedPosition >= 0 && scopedPosition < filteredNavigationIndices.length - 1) {
       setCurrentIndex(filteredNavigationIndices[scopedPosition + 1]);
       return;
     }
-    if (useFilteredNavigation && scopedPosition === -1 && filteredNavigationIndices.length > 0) {
+    if (effectiveUseFilteredNavigation && scopedPosition === -1 && filteredNavigationIndices.length > 0) {
       setCurrentIndex(filteredNavigationIndices[0]);
       return;
     }
     handleNext();
-  }, [useFilteredNavigation, scopedPosition, filteredNavigationIndices, setCurrentIndex, handleNext]);
+  }, [effectiveUseFilteredNavigation, scopedPosition, filteredNavigationIndices, setCurrentIndex, handleNext]);
 
   const startFilteredScope = () => {
     if (filteredNavigationIndices.length === 0) {
@@ -1482,9 +2346,24 @@ const DataLabelingWorkspace = () => {
     const randomIndex = pendingIndices[Math.floor(Math.random() * pendingIndices.length)];
     setCurrentIndex(randomIndex);
     setViewMode('record');
-    setUseFilteredNavigation(hasActiveFilters);
+    setUseFilteredNavigation(isAnnotatorForProject ? true : hasActiveFilters);
   };
 
+
+  // Serialize data in a Web Worker to keep the main thread responsive
+  const serializeInWorker = (dataPoints: DataPoint[], fieldConfig: FieldConfig): Promise<Blob> =>
+    new Promise((resolve, reject) => {
+      const worker = new Worker(
+        new URL('../workers/exportWorker.ts', import.meta.url),
+        { type: 'module' }
+      );
+      worker.postMessage({ dataPoints, fieldConfig });
+      worker.onmessage = (e: MessageEvent<{ buffer: ArrayBuffer; mimeType: string }>) => {
+        resolve(new Blob([e.data.buffer], { type: e.data.mimeType }));
+        worker.terminate();
+      };
+      worker.onerror = (e) => { reject(new Error(e.message)); worker.terminate(); };
+    });
 
   // Publish to Hugging Face
   const publishToHuggingFace = async () => {
@@ -1497,17 +2376,20 @@ const DataLabelingWorkspace = () => {
     setUploadError(null);
 
     try {
-      const repoId = `${hfUsername}/${hfDatasetName}`;
-      const blob = exportService.generateJSONLBlob(filteredDataPoints);
+      // Step 1: Serialize in worker (off main thread)
+      setPublishProgress({ step: 'Preparing data...', pct: 10 });
+      const blob = await serializeInWorker(filteredDataPoints, HF_FIELD_CONFIG);
 
+      // Step 2: Upload via service (with repo check + retry + progress)
+      const repoId = `${hfUsername}/${hfDatasetName}`;
       await huggingFaceService.publishDataset(
         repoId,
         blob,
-        { accessToken: hfToken }
+        { accessToken: hfToken },
+        'data.jsonl',
+        (step, pct) => setPublishProgress({ step, pct })
       );
 
-      // Success!
-      // Success!
       setShowHFDialog(false);
       setPublishedUrl(`https://huggingface.co/datasets/${repoId}`);
       setShowPublishSuccessDialog(true);
@@ -1516,6 +2398,7 @@ const DataLabelingWorkspace = () => {
       setUploadError(`Failed to publish: ${error.message}`);
     } finally {
       setIsPublishing(false);
+      setPublishProgress(null);
     }
   };
 
@@ -1525,14 +2408,14 @@ const DataLabelingWorkspace = () => {
   useEffect(() => {
     if (isEditMode && currentDataPoint) {
       // If editing existing final annotation, use that. Otherwise empty.
-      setTempAnnotation(currentDataPoint.finalAnnotation || '');
+      setTempAnnotation(getVisibleFinalAnnotation(currentDataPoint));
     }
   }, [isEditMode, currentIndex]);
 
   // Save HF credentials to localStorage
   useEffect(() => {
-    if (hfUsername) localStorage.setItem('databayt-hf-username', hfUsername);
-    if (hfToken) localStorage.setItem('databayt-hf-token', hfToken);
+    if (hfUsername) sessionStorage.setItem('databayt-hf-username', hfUsername);
+    if (hfToken) sessionStorage.setItem('databayt-hf-token', hfToken);
   }, [hfUsername, hfToken]);
 
 
@@ -1602,44 +2485,45 @@ const DataLabelingWorkspace = () => {
   return (
     <TooltipProvider>
       <div className="flex h-screen bg-background">
+
         {/* Keyboard Shortcuts Overlay */}
         {showShortcuts && (
           <div className="absolute inset-0 bg-black/50 z-50 flex items-center justify-center backdrop-blur-sm">
             <Card className="p-6 max-w-lg animate-scale-in">
               <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
                 <Keyboard className="w-5 h-5" />
-                Keyboard Shortcuts
+                {t("workspace.keyboardShortcuts")}
               </h3>
               <div className="grid grid-cols-2 gap-4 text-sm">
                 <div className="space-y-2">
                   <div className="flex justify-between">
-                    <span>Next Sample</span>
+                    <span>{t("workspace.nextSample")}</span>
                     <kbd className="px-2 py-1 bg-muted rounded text-xs">→</kbd>
                   </div>
                   <div className="flex justify-between">
-                    <span>Previous Sample</span>
+                    <span>{t("workspace.previousSample")}</span>
                     <kbd className="px-2 py-1 bg-muted rounded text-xs">←</kbd>
                   </div>
                   <div className="flex justify-between">
-                    <span>Save Edit</span>
+                    <span>{t("workspace.saveEdit")}</span>
                     <kbd className="px-2 py-1 bg-muted rounded text-xs">S</kbd>
                   </div>
                 </div>
                 <div className="space-y-2">
                   <div className="flex justify-between">
-                    <span>Process All AI</span>
+                    <span>{t("workspace.processAllAI")}</span>
                     <kbd className="px-2 py-1 bg-muted rounded text-xs">P</kbd>
                   </div>
                   <div className="flex justify-between">
-                    <span>Cancel/Escape</span>
+                    <span>{t("workspace.cancelEscape")}</span>
                     <kbd className="px-2 py-1 bg-muted rounded text-xs">Esc</kbd>
                   </div>
                   <div className="flex justify-between">
-                    <span>Undo</span>
+                    <span>{t("workspace.undo")}</span>
                     <kbd className="px-2 py-1 bg-muted rounded text-xs">Ctrl+Z</kbd>
                   </div>
                   <div className="flex justify-between">
-                    <span>Redo</span>
+                    <span>{t("workspace.redo")}</span>
                     <kbd className="px-2 py-1 bg-muted rounded text-xs">Ctrl+Shift+Z</kbd>
                   </div>
                 </div>
@@ -1649,137 +2533,231 @@ const DataLabelingWorkspace = () => {
                 variant="outline"
                 onClick={() => setShowShortcuts(false)}
               >
-                Close
+                {t("common.close")}
               </Button>
             </Card>
           </div>
         )}
         {/* Header */}
-        <div className="absolute top-0 left-0 right-0 z-10 border-b border-border bg-card p-4">
+        <div className="absolute top-0 left-0 right-0 z-10 border-b border-border bg-card px-4 py-2.5">
           <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon" onClick={undo} disabled={!canUndo}>
-                    <Undo2 className="w-4 h-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Undo (Ctrl+Z)</TooltipContent>
-              </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon" onClick={redo} disabled={!canRedo}>
-                    <Redo2 className="w-4 h-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Redo (Ctrl+Shift+Z)</TooltipContent>
-              </Tooltip>
-              <div className="h-6 w-px bg-border mx-1" />
-              <Button variant="ghost" size="icon" onClick={() => navigate('/')}>
-                <ArrowLeft className="w-5 h-5" />
+            {/* ── Left: nav + title ── */}
+            <div className="flex items-center gap-2 min-w-0">
+              <Button
+                variant="ghost" size="icon" className="h-8 w-8 shrink-0"
+                onClick={() => viewMode === 'record' ? setViewMode('list') : navigate('/')}
+              >
+                {isRTL ? <ArrowRight className="w-4 h-4" /> : <ArrowLeft className="w-4 h-4" />}
               </Button>
-              {viewMode === 'record' && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setViewMode('list')}
-                >
-                  Back to list
-                </Button>
-              )}
-              <div className="w-8 h-8 rounded-lg bg-gradient-to-r from-blue-500 to-purple-600 flex items-center justify-center">
-                <Target className="w-4 h-4 text-white" />
+              <div className="h-5 w-px bg-border mx-0.5 shrink-0" />
+              <div className="w-7 h-7 rounded-md bg-gradient-to-r from-blue-500 to-purple-600 flex items-center justify-center shrink-0">
+                <Target className="w-3.5 h-3.5 text-white" />
               </div>
-              <div>
-                <h1 className="text-xl font-semibold text-foreground">{projectName || 'DataBayt AI Labeler'}</h1>
-                <p className="text-sm text-muted-foreground">
-                  {dataPoints.length > 0 ? `Data point ${currentIndex + 1} of ${dataPoints.length}` : 'No data loaded'}
+              <div className="min-w-0">
+                <h1 className="text-sm font-semibold text-foreground truncate">{projectName || 'DataBayt AI Labeler'}</h1>
+                <p className="text-xs text-muted-foreground">
+                  {dataPoints.length > 0 ? t("workspace.dataPointOf", { current: globalCurrentRecordIndex, total: globalTotalItems }) : t("workspace.noDataLoaded")}
                 </p>
               </div>
             </div>
 
-            <div className="flex items-center gap-4">
-              {dataPoints.length > 0 && (
-                <div className="text-right">
-                  <p className="text-sm font-medium text-foreground">{completedCount} completed</p>
-                  <div className="flex items-center gap-2">
-                    <Progress value={progress} className="w-32 h-2" />
-                    <span className="text-xs text-muted-foreground font-mono">{Math.round(progress)}%</span>
-                  </div>
-                </div>
+            {/* ── Center: progress ── */}
+            {dataPoints.length > 0 && (
+              <div id="tutorial-progress" className="hidden sm:flex items-center gap-3 mx-4">
+                <Progress value={progress} className="w-28 h-2" />
+                <span className="text-xs text-muted-foreground font-mono whitespace-nowrap">
+                  {globalCompletedCount}/{globalTotalItems} ({Math.round(progress)}%)
+                </span>
+              </div>
+            )}
+
+            {/* ── Right: actions ── */}
+            <div className="flex items-center gap-1.5 shrink-0">
+              {/* Undo / Redo */}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button variant="ghost" size="icon" className="h-8 w-8" onClick={undo} disabled={!canUndo}>
+                    {isRTL ? <Redo2 className="w-4 h-4" /> : <Undo2 className="w-4 h-4" />}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>{t("workspace.undoCtrl")}</TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button variant="ghost" size="icon" className="h-8 w-8" onClick={redo} disabled={!canRedo}>
+                    {isRTL ? <Undo2 className="w-4 h-4" /> : <Redo2 className="w-4 h-4" />}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>{t("workspace.redoCtrl")}</TooltipContent>
+              </Tooltip>
+
+              <div className="h-5 w-px bg-border mx-0.5" />
+
+              {/* Navigation prev/next */}
+              {dataPoints.length > 0 && viewMode === 'record' && (
+                <>
+                  <Button
+                    id="tutorial-nav-prev"
+                    variant="outline"
+                    size="icon"
+                    className="h-8 w-8"
+                    onClick={navigatePrevious}
+                    disabled={useFilteredNavigation ? !scopedHasPrevious : currentIndex === 0}
+                  >
+                    {isRTL ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4" />}
+                  </Button>
+                  <Button
+                    id="tutorial-nav-next"
+                    variant="outline"
+                    size="icon"
+                    className="h-8 w-8"
+                    onClick={navigateNext}
+                    disabled={useFilteredNavigation ? !scopedHasNext : currentIndex === dataPoints.length - 1}
+                  >
+                    {isRTL ? <ChevronLeft className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                  </Button>
+                </>
               )}
 
-              <Separator orientation="vertical" className="h-8" />
+              <div className="h-5 w-px bg-border mx-0.5" />
 
-              <div className="flex gap-2">
-                {/* File Upload */}
+              {/* Quality button — stays visible for managers */}
+              {(isAdmin || isManagerForProject) && (
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={isUploading || !canUpload}
-                      title={!canUpload ? "Requires manager or admin role" : undefined}
-                      onClick={() => document.getElementById('file-upload')?.click()}
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8"
+                      onClick={() => setShowQualityDialog(true)}
+                      disabled={!projectId}
                     >
-                      {isUploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+                      <BarChart3 className="h-4 w-4" />
                     </Button>
                   </TooltipTrigger>
-                  <TooltipContent>Upload data file (JSON, CSV, TXT)</TooltipContent>
+                  <TooltipContent>{t("workspace.quality")}</TooltipContent>
                 </Tooltip>
-                <input
-                  id="file-upload"
-                  type="file"
-                  accept=".json,.csv,.txt"
-                  onChange={handleFileUpload}
-                  disabled={!canUpload}
-                  className="hidden"
-                />
+              )}
 
-                {/* Hidden input for new task upload */}
-                <input
-                  id="file-upload-new-task"
-                  type="file"
-                  accept=".json,.csv,.txt"
-                  onChange={(e) => {
-                    resetForNewTask();
-                    handleFileUpload(e);
-                  }}
-                  disabled={!canUpload}
-                  className="hidden"
-                />
 
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="mr-1"
-                  onClick={() => setShowHistoryDialog(true)}
-                  disabled={!projectId}
-                >
-                  <History className="h-5 w-5" />
-                </Button>
-                {/* Settings */}
-                <Dialog open={showSettings} onOpenChange={setShowSettings}>
-                  <DialogTrigger asChild>
+              <div className="h-5 w-px bg-border mx-0.5" />
+
+              {/* Secondary actions — inline icon buttons */}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost" size="icon" className="h-8 w-8"
+                    onClick={() => setShowHistoryDialog(true)}
+                    disabled={!projectId}
+                  >
+                    <History className="w-4 h-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>{t("workspace.versionHistory")}</TooltipContent>
+              </Tooltip>
+
+              {canProcessAI && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
                     <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={!canProcessAI}
-                      title={!canProcessAI ? "Requires manager or admin role" : undefined}
+                      variant="ghost" size="icon" className="h-8 w-8"
+                      onClick={() => setShowSettings(true)}
                     >
-                      <Settings className="w-4 h-4" />
+                      <Bot className="w-4 h-4" />
                     </Button>
-                  </DialogTrigger>
+                  </TooltipTrigger>
+                  <TooltipContent>{t("workspace.modelSelection")}</TooltipContent>
+                </Tooltip>
+              )}
+
+              <div className="h-5 w-px bg-border mx-0.5" />
+
+              {viewMode === 'record' && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost" size="icon" className="h-8 w-8"
+                      onClick={() => setShowShortcuts(true)}
+                    >
+                      <Keyboard className="w-4 h-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t("workspace.keyboardShortcutsTooltip")}</TooltipContent>
+                </Tooltip>
+              )}
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost" size="icon" className="h-8 w-8"
+                    onClick={startWorkspaceTour}
+                  >
+                    <HelpCircle className="w-4 h-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>{t("workspace.startTutorial")}</TooltipContent>
+              </Tooltip>
+
+              <NotificationBell />
+              <ThemeToggle />
+              <UserMenu />
+
+              {/* Hidden file inputs */}
+              <input
+                id="file-upload"
+                type="file"
+                accept=".json,.csv,.txt,.mp3,.wav,.m4a"
+                onChange={handleFileUpload}
+                disabled={!canUpload}
+                className="hidden"
+              />
+              <input
+                id="file-upload-new-task"
+                type="file"
+                accept=".json,.csv,.txt,.mp3,.wav,.m4a"
+                onChange={(e) => {
+                  resetForNewTask();
+                  handleFileUpload(e);
+                }}
+                disabled={!canUpload}
+                className="hidden"
+              />
+
+              {/* Start New Task Button (shows after completion) */}
+              {showCompletionButton && viewMode === 'record' && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="default"
+                      size="icon"
+                      className="h-8 w-8 bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700"
+                      onClick={handleStartNewTask}
+                      disabled={!canUpload}
+                    >
+                      <Upload className="w-4 h-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t("workspace.uploadFileForTask")}</TooltipContent>
+                </Tooltip>
+              )}
+            </div>
+          </div>
+        </div>
+
+                {/* ═══ Dialogs (portaled, outside header) ═══ */}
+
+                {/* Settings / Model Selection Dialog */}
+                <Dialog open={showSettings} onOpenChange={setShowSettings}>
                   <DialogContent className="max-w-md max-h-[80vh] overflow-y-auto">
                     <DialogHeader>
-                      <DialogTitle>Model Selection</DialogTitle>
+                      <DialogTitle>{t("workspace.modelSelection")}</DialogTitle>
                     </DialogHeader>
                     <div className="space-y-6">
                       <div>
-                        <Label className="mb-2 block">Available Model Profiles</Label>
+                        <Label className="mb-2 block">{t("workspace.availableModelProfiles")}</Label>
                         {availableModelProfiles.length === 0 ? (
                           <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
-                            No model profiles assigned to this project yet.
+                            {t("workspace.noModelProfiles")}
                           </div>
                         ) : (
                           <div className="space-y-2">
@@ -1815,34 +2793,159 @@ const DataLabelingWorkspace = () => {
                       </div>
 
                       {canProcessAI && (
+                        <div className="space-y-2">
+                          <Label className="mb-1 block">
+                            {t("workspace.aiInstructionsLabel")} <span className="text-muted-foreground font-normal text-xs">({t("common.optional").toLowerCase()})</span>
+                          </Label>
+                          <Textarea
+                            rows={5}
+                            className="font-mono text-xs"
+                            placeholder={t("workspace.aiInstructionsPlaceholder")}
+                            value={aiInstruction}
+                            onChange={e => setAiInstruction(e.target.value)}
+                            onBlur={async () => {
+                              if (!projectAccess) return;
+                              try {
+                                await projectService.update({ ...projectAccess, aiInstruction });
+                                setProjectAccess(p => p ? { ...p, aiInstruction } : p);
+                              } catch {
+                                toast({ title: t("common.error"), description: t("workspace.failedSave"), variant: "destructive" });
+                              }
+                            }}
+                          />
+                          {(() => {
+                            const cols = Array.from(new Set(dataPoints.flatMap(dp => Object.keys(dp.metadata ?? {}))));
+                            return cols.length > 0 ? (
+                              <div className="flex flex-wrap gap-1.5">
+                                <span className="text-xs text-muted-foreground self-center">{t("workspace.insertColumn")}</span>
+                                {cols.map(col => (
+                                  <Badge
+                                    key={col}
+                                    variant="secondary"
+                                    className="cursor-pointer text-xs hover:bg-primary/20 transition-colors"
+                                    onClick={() => setAiInstruction(prev => prev + ` {{${col}}}`)}
+                                  >
+                                    {col}
+                                  </Badge>
+                                ))}
+                              </div>
+                            ) : null;
+                          })()}
+                          <p className="text-xs text-muted-foreground">
+                            {t("workspace.aiInstructionsHelp")}
+                          </p>
+                        </div>
+                      )}
+
+                      {canProcessAI && (
                         <Button variant="outline" onClick={() => navigate('/model-management')}>
-                          Manage Model Profiles
+                          {t("workspace.manageModelProfiles")}
                         </Button>
                       )}
                     </div>
                   </DialogContent>
                 </Dialog>
 
-                {/* Upload Prompt Dialog */}
-                <Dialog open={showUploadPrompt} onOpenChange={setShowUploadPrompt}>
+                {/* HuggingFace Import Dialog */}
+                <Dialog open={showHFImportDialog} onOpenChange={setShowHFImportDialog}>
                   <DialogContent className="max-w-lg">
                     <DialogHeader>
-                      <DialogTitle>Configure Dataset Options</DialogTitle>
+                      <DialogTitle>{t("workspace.importFromHuggingFace")}</DialogTitle>
+                      <DialogDescription>
+                        {t("workspace.hfImportDescription")}
+                      </DialogDescription>
                     </DialogHeader>
                     <div className="space-y-4">
                       <div>
-                        <Label htmlFor="upload-prompt">Custom AI Instructions (Optional)</Label>
+                        <Label htmlFor="hf-import-dataset">{t("workspace.datasetId")}</Label>
+                        <Input
+                          id="hf-import-dataset"
+                          placeholder="username/dataset_name"
+                          value={hfImportDataset}
+                          onChange={(e) => setHfImportDataset(e.target.value)}
+                        />
+                      </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <Label htmlFor="hf-import-config">{t("workspace.configOptional")}</Label>
+                          <Input
+                            id="hf-import-config"
+                            placeholder="default"
+                            value={hfImportConfig}
+                            onChange={(e) => setHfImportConfig(e.target.value)}
+                          />
+                        </div>
+                        <div>
+                          <Label htmlFor="hf-import-split">{t("workspace.splitOptional")}</Label>
+                          <Input
+                            id="hf-import-split"
+                            placeholder="train"
+                            value={hfImportSplit}
+                            onChange={(e) => setHfImportSplit(e.target.value)}
+                          />
+                        </div>
+                      </div>
+                      <div>
+                        <Label htmlFor="hf-import-max-rows">{t("workspace.maxRows")}</Label>
+                        <Input
+                          id="hf-import-max-rows"
+                          type="number"
+                          min={1}
+                          value={hfImportMaxRows}
+                          placeholder="Auto: full split"
+                          onChange={(e) => {
+                            const raw = e.target.value.trim();
+                            if (!raw) {
+                              setHfImportMaxRows("");
+                              return;
+                            }
+                            const parsed = Number(raw);
+                            setHfImportMaxRows(Number.isFinite(parsed) ? Math.max(1, Math.floor(parsed)) : "");
+                          }}
+                        />
+                        <p className="text-xs text-muted-foreground mt-1">{t("workspace.leaveEmptyImport")}</p>
+                      </div>
+                      <div className="flex justify-end gap-2">
+                        <Button variant="outline" onClick={() => setShowHFImportDialog(false)} disabled={isImportingHF}>{t("common.cancel")}</Button>
+                        <Button onClick={handleImportFromHuggingFace} disabled={isImportingHF || !hfImportDataset.trim()}>
+                          {isImportingHF ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Database className="w-4 h-4 mr-2" />}
+                          {t("workspace.importDataset")}
+                        </Button>
+                      </div>
+                    </div>
+                  </DialogContent>
+                </Dialog>
+
+                {/* ── Unified Import Wizard ──────────────────────────────────── */}
+                <ImportWizard
+                  open={isWizardOpen}
+                  onClose={closeWizard}
+                  onImport={importData}
+                  onImportMultiple={importMultipleFiles}
+                  isImporting={isWizardUploading}
+                  fetchHFRows={fetchHuggingFaceRows}
+                />
+
+                {/* Upload Prompt Dialog (legacy — kept for backward compat) */}
+                <Dialog open={showUploadPrompt} onOpenChange={setShowUploadPrompt}>
+                  <DialogContent className="max-w-lg">
+                    <DialogHeader>
+                      <DialogTitle>{t("workspace.configureDatasetsOptions")}</DialogTitle>
+                    </DialogHeader>
+                    <div className="space-y-4">
+                      <div>
+                        <Label htmlFor="upload-prompt">{t("workspace.customAIInstructions")}</Label>
                         <Textarea
                           id="upload-prompt"
                           value={uploadPrompt}
                           onChange={(e) => setUploadPrompt(e.target.value)}
-                          placeholder="Enter specific instructions for the AI model (optional)..."
+                          placeholder={t("workspace.customAIPlaceholder")}
                           rows={3}
                         />
 
                         {availableColumns.length > 0 && (
                           <div className="mt-2">
-                            <p className="text-xs text-muted-foreground mb-1.5">Available variables (click to insert):</p>
+                            <p className="text-xs text-muted-foreground mb-1.5">{t("workspace.availableVariables")}</p>
                             <div className="flex flex-wrap gap-1.5">
                               {availableColumns.map(col => (
                                 <Badge
@@ -1859,20 +2962,20 @@ const DataLabelingWorkspace = () => {
                         )}
 
                         <p className="text-xs text-muted-foreground mt-1">
-                          This prompt will be applied to each data point for AI processing. Use variables like <code>{`{{ColumnName}}`}</code> to insert dynamic data.
+                          {t("workspace.promptHelp")}
                         </p>
                       </div>
 
                       <div>
-                        <Label htmlFor="custom-field">Custom Annotation Field (Optional)</Label>
+                        <Label htmlFor="custom-field">{t("workspace.customAnnotationField")}</Label>
                         <Input
                           id="custom-field"
                           value={customFieldName}
                           onChange={(e) => setCustomFieldName(e.target.value)}
-                          placeholder="e.g., Priority Level, Category, Notes..."
+                          placeholder={t("workspace.customAnnotationFieldPlaceholder")}
                         />
                         <p className="text-xs text-muted-foreground mt-1">
-                          Create your own annotation field alongside AI suggestions for custom labeling.
+                          {t("workspace.customAnnotationFieldHelp")}
                         </p>
                       </div>
 
@@ -1880,13 +2983,13 @@ const DataLabelingWorkspace = () => {
                       {availableColumns.length > 0 && (
                         <div className="space-y-4 pt-2 border-t">
                           <div>
-                            <Label htmlFor="content-column">Primary Content Column</Label>
+                            <Label htmlFor="content-column">{t("workspace.primaryContentColumn")}</Label>
                             <Select
                               value={selectedContentColumn}
                               onValueChange={setSelectedContentColumn}
                             >
                               <SelectTrigger id="content-column">
-                                <SelectValue placeholder="Select the main content column" />
+                                <SelectValue placeholder={t("workspace.selectMainContentColumn")} />
                               </SelectTrigger>
                               <SelectContent>
                                 {availableColumns.map(col => (
@@ -1895,12 +2998,12 @@ const DataLabelingWorkspace = () => {
                               </SelectContent>
                             </Select>
                             <p className="text-xs text-muted-foreground mt-1">
-                              This column will be displayed as the main content for annotation.
+                              {t("workspace.primaryContentColumnHelp")}
                             </p>
                           </div>
 
                           <div>
-                            <Label>Additional Columns to Display</Label>
+                            <Label>{t("workspace.additionalColumns")}</Label>
                             <div className="grid grid-cols-2 gap-2 mt-2 max-h-32 overflow-y-auto">
                               {availableColumns.filter(col => col !== selectedContentColumn).map(col => (
                                 <div key={col} className="flex items-center space-x-2">
@@ -1925,7 +3028,7 @@ const DataLabelingWorkspace = () => {
                               ))}
                             </div>
                             <p className="text-xs text-muted-foreground mt-1">
-                              Selected columns will appear in the metadata sidebar.
+                              {t("workspace.additionalColumnsHelp")}
                             </p>
                           </div>
                         </div>
@@ -1937,88 +3040,28 @@ const DataLabelingWorkspace = () => {
                           onClick={() => {
                             setShowUploadPrompt(false);
                             setPendingFile(null);
+                            setPendingHFRows(null);
                             setUploadPrompt('');
                             setSelectedContentColumn('');
                             setSelectedDisplayColumns([]);
                           }}
                         >
-                          Cancel
+                          {t("common.cancel")}
                         </Button>
                         <Button
                           onClick={() => {
-                            if (pendingFile) {
+                            if (pendingHFRows) {
+                              processFileUpload(null, uploadPrompt, customFieldName, pendingHFRows);
+                              setPendingHFRows(null);
+                            } else if (pendingFile) {
                               processFileUpload(pendingFile, uploadPrompt, customFieldName);
                               setPendingFile(null);
                             }
                           }}
-                          disabled={availableColumns.length > 0 && !selectedContentColumn}
+                          disabled={(availableColumns.length > 0 && !selectedContentColumn) || (!pendingFile && !pendingHFRows)}
                         >
-                          Upload File
+                          {pendingHFRows ? t("workspace.importDatasetButton") : t("workspace.uploadFile")}
                         </Button>
-                      </div>
-                    </div>
-                  </DialogContent>
-                </Dialog>
-
-                {/* XML Editor Dialog */}
-                <Dialog open={showXmlEditor} onOpenChange={setShowXmlEditor}>
-                  <DialogContent className="max-w-2xl max-h-[80vh]">
-                    <DialogHeader>
-                      <DialogTitle>Customize Annotation Fields</DialogTitle>
-                      <DialogDescription>
-                        Edit the XML configuration below to customize your annotation form.
-                      </DialogDescription>
-                    </DialogHeader>
-                    <div className="space-y-4">
-                      {availableColumns.length > 0 && (
-                        <div>
-                          <Label className="text-sm font-medium">Available Columns (click to insert):</Label>
-                          <div className="flex flex-wrap gap-1.5 mt-2">
-                            {availableColumns.map(col => (
-                              <Badge
-                                key={col}
-                                variant="secondary"
-                                className="cursor-pointer hover:bg-purple-100 dark:hover:bg-purple-900/30 transition-colors"
-                                onClick={() => insertColumnToXml(col)}
-                              >
-                                {col}
-                              </Badge>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                      <Textarea
-                        value={xmlEditorContent}
-                        onChange={(e) => setXmlEditorContent(e.target.value)}
-                        className="font-mono text-sm min-h-[300px]"
-                        placeholder="Enter XML configuration..."
-                      />
-                      <div className="flex gap-2 justify-between">
-                        <div className="flex gap-2">
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => document.getElementById('xml-file-upload')?.click()}
-                          >
-                            <Upload className="w-4 h-4 mr-2" />
-                            Upload XML
-                          </Button>
-                          <input
-                            id="xml-file-upload"
-                            type="file"
-                            accept=".xml"
-                            onChange={handleXmlConfigUpload}
-                            className="hidden"
-                          />
-                        </div>
-                        <div className="flex gap-2">
-                          <Button variant="outline" onClick={() => setShowXmlEditor(false)}>
-                            Cancel
-                          </Button>
-                          <Button onClick={applyXmlConfig}>
-                            Apply Configuration
-                          </Button>
-                        </div>
                       </div>
                     </div>
                   </DialogContent>
@@ -2028,21 +3071,20 @@ const DataLabelingWorkspace = () => {
                 <Dialog open={showReRunConfirmation} onOpenChange={setShowReRunConfirmation}>
                   <DialogContent>
                     <DialogHeader>
-                      <DialogTitle>Re-run AI Processing?</DialogTitle>
+                      <DialogTitle>{t("workspace.reRunAITitle")}</DialogTitle>
                       <DialogDescription>
-                        The selected models have already been run on all available data points.
-                        Do you want to re-run them and overwrite the existing suggestions?
+                        {t("workspace.reRunAIDescription")}
                       </DialogDescription>
                     </DialogHeader>
                     <DialogFooter>
                       <Button variant="outline" onClick={() => setShowReRunConfirmation(false)}>
-                        Cancel
+                        {t("common.cancel")}
                       </Button>
                       <Button onClick={() => {
                         setShowReRunConfirmation(false);
                         requestProcessScope(reRunScope, true);
                       }}>
-                        Yes, Re-run
+                        {t("workspace.yesRerun")}
                       </Button>
                     </DialogFooter>
                   </DialogContent>
@@ -2052,37 +3094,37 @@ const DataLabelingWorkspace = () => {
                 <Dialog open={showTokenEstimateDialog} onOpenChange={setShowTokenEstimateDialog}>
                   <DialogContent>
                     <DialogHeader>
-                      <DialogTitle>Confirm AI Processing</DialogTitle>
+                      <DialogTitle>{t("workspace.confirmAITitle")}</DialogTitle>
                       <DialogDescription>
-                        Review the estimated input tokens before processing.
+                        {t("workspace.confirmAIDescription")}
                       </DialogDescription>
                     </DialogHeader>
                     <div className="space-y-3 text-sm">
                       <div className="flex items-center justify-between">
-                        <span>Scope</span>
+                        <span>{t("workspace.scope")}</span>
                         <span className="font-medium capitalize">{pendingProcessScope}</span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span>Items</span>
+                        <span>{t("workspace.items")}</span>
                         <span className="font-medium">{tokenEstimate?.items ?? 0}</span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span>Models</span>
+                        <span>{t("workspace.models")}</span>
                         <span className="font-medium">{tokenEstimate?.models ?? 0}</span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span>Estimated input tokens</span>
+                        <span>{t("workspace.estimatedInputTokens")}</span>
                         <span className="font-medium">{(tokenEstimate?.inputTokens ?? 0).toLocaleString()}</span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span>Estimated input cost</span>
+                        <span>{t("workspace.estimatedInputCost")}</span>
                         <span className="font-medium">
-                          {estimatedInputCost ? `$${estimatedInputCost.total.toFixed(4)}` : 'Unavailable'}
+                          {estimatedInputCost ? `$${estimatedInputCost.total.toFixed(4)}` : t("workspace.unavailable")}
                         </span>
                       </div>
                       {perModelCostBreakdown.length > 0 && (
                         <div className="rounded-md border border-border/60 p-3 text-xs space-y-2">
-                          <div className="font-medium text-foreground">Per-model breakdown</div>
+                          <div className="font-medium text-foreground">{t("workspace.perModelBreakdown")}</div>
                           {perModelCostBreakdown.map(item => (
                             <div key={item.id} className="flex items-center justify-between gap-3">
                               <span className="text-muted-foreground truncate">{item.displayName}</span>
@@ -2096,26 +3138,26 @@ const DataLabelingWorkspace = () => {
                       )}
                       {estimatedInputCost?.missing?.length ? (
                         <p className="text-xs text-muted-foreground">
-                          Pricing unavailable for {estimatedInputCost.missing.length} model(s).
+                          {t("workspace.pricingUnavailable", { count: estimatedInputCost.missing.length })}
                         </p>
                       ) : null}
                       <p className="text-xs text-muted-foreground">
-                        OpenAI and Anthropic use built-in official pricing. OpenRouter pricing is loaded from OpenRouter API. Other providers require manual profile pricing.
+                        {t("workspace.pricingNote")}
                       </p>
                       <p className="text-xs text-muted-foreground">
-                        Token counts are estimates and may differ from provider billing.
+                        {t("workspace.tokenCountNote")}
                       </p>
                     </div>
                     <DialogFooter>
                       <Button variant="outline" onClick={() => setShowTokenEstimateDialog(false)}>
-                        Cancel
+                        {t("common.cancel")}
                       </Button>
                       <Button onClick={() => {
                         setShowTokenEstimateDialog(false);
                         setReRunScope(pendingProcessScope);
                         processScopeWithAI(getScopeDataPoints(pendingProcessScope), pendingProcessForce);
                       }}>
-                        Proceed
+                        {t("workspace.proceed")}
                       </Button>
                     </DialogFooter>
                   </DialogContent>
@@ -2125,9 +3167,9 @@ const DataLabelingWorkspace = () => {
                 <Dialog open={showExportDialog} onOpenChange={setShowExportDialog}>
                   <DialogContent className="sm:max-w-md">
                     <DialogHeader>
-                      <DialogTitle>Export Filtered Results</DialogTitle>
+                      <DialogTitle>{t("workspace.exportFilteredResults")}</DialogTitle>
                       <DialogDescription>
-                        Exports the current filtered list ({filteredDataPoints.length} items).
+                        {t("workspace.exportDescription", { count: filteredDataPoints.length })}
                       </DialogDescription>
                     </DialogHeader>
                     <div className="grid grid-cols-1 gap-4 py-4">
@@ -2142,8 +3184,8 @@ const DataLabelingWorkspace = () => {
                         title={!canExport ? "Requires manager or admin role" : undefined}
                       >
                         <div className="flex flex-col items-start gap-1">
-                          <span className="font-semibold">JSON (Standard)</span>
-                          <span className="text-xs text-muted-foreground">Best for backups and re-importing.</span>
+                          <span className="font-semibold">{t("workspace.jsonStandard")}</span>
+                          <span className="text-xs text-muted-foreground">{t("workspace.jsonStandardDesc")}</span>
                         </div>
                       </Button>
                       <Button
@@ -2157,8 +3199,8 @@ const DataLabelingWorkspace = () => {
                         title={!canExport ? "Requires manager or admin role" : undefined}
                       >
                         <div className="flex flex-col items-start gap-1">
-                          <span className="font-semibold">CSV (Spreadsheet)</span>
-                          <span className="text-xs text-muted-foreground">Best for Excel, Google Sheets, and analysis.</span>
+                          <span className="font-semibold">{t("workspace.csvSpreadsheet")}</span>
+                          <span className="text-xs text-muted-foreground">{t("workspace.csvSpreadsheetDesc")}</span>
                         </div>
                       </Button>
                       <Button
@@ -2172,8 +3214,8 @@ const DataLabelingWorkspace = () => {
                         title={!canExport ? "Requires manager or admin role" : undefined}
                       >
                         <div className="flex flex-col items-start gap-1">
-                          <span className="font-semibold">Hugging Face Dataset (JSONL)</span>
-                          <span className="text-xs text-muted-foreground">Best for fine-tuning and machine learning.</span>
+                          <span className="font-semibold">{t("workspace.hfDataset")}</span>
+                          <span className="text-xs text-muted-foreground">{t("workspace.hfDatasetDesc")}</span>
                         </div>
                       </Button>
                       <Button variant="outline" className="justify-start h-auto py-4 px-4 border-purple-200 bg-purple-50/50 hover:bg-purple-100 dark:border-purple-800 dark:bg-purple-950/20 dark:hover:bg-purple-900/40" onClick={() => {
@@ -2182,16 +3224,16 @@ const DataLabelingWorkspace = () => {
                       }}>
                         <div className="flex flex-col items-start gap-1">
                           <span className="font-semibold flex items-center gap-2">
-                            Publish to Hugging Face
+                            {t("workspace.publishToHF")}
                             <Badge variant="secondary" className="text-[10px] h-4">New</Badge>
                           </span>
-                          <span className="text-xs text-muted-foreground">Upload directly to your HF profile.</span>
+                          <span className="text-xs text-muted-foreground">{t("workspace.publishToHFDesc")}</span>
                         </div>
                       </Button>
                     </div>
                     <DialogFooter className="sm:justify-start">
                       <Button type="button" variant="secondary" onClick={() => setShowExportDialog(false)}>
-                        Cancel
+                        {t("common.cancel")}
                       </Button>
                     </DialogFooter>
                   </DialogContent>
@@ -2201,14 +3243,14 @@ const DataLabelingWorkspace = () => {
                 <Dialog open={showHFDialog} onOpenChange={setShowHFDialog}>
                   <DialogContent className="sm:max-w-md">
                     <DialogHeader>
-                      <DialogTitle>Publish to Hugging Face</DialogTitle>
+                      <DialogTitle>{t("workspace.publishToHF")}</DialogTitle>
                       <DialogDescription>
-                        Upload your dataset directly to the Hugging Face Hub.
+                        {t("workspace.publishToHFDialogDesc", { count: filteredDataPoints.length })}
                       </DialogDescription>
                     </DialogHeader>
                     <div className="space-y-4 py-4">
                       <div className="space-y-2">
-                        <Label htmlFor="hf-username">Username</Label>
+                        <Label htmlFor="hf-username">{t("workspace.hfUsername")}</Label>
                         <Input
                           id="hf-username"
                           placeholder="Hugging Face Username"
@@ -2217,7 +3259,7 @@ const DataLabelingWorkspace = () => {
                         />
                       </div>
                       <div className="space-y-2">
-                        <Label htmlFor="hf-token">Write Token</Label>
+                        <Label htmlFor="hf-token">{t("workspace.hfWriteToken")}</Label>
                         <Input
                           id="hf-token"
                           type="password"
@@ -2226,11 +3268,11 @@ const DataLabelingWorkspace = () => {
                           onChange={(e) => setHfToken(e.target.value)}
                         />
                         <p className="text-xs text-muted-foreground">
-                          Get your token from <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noreferrer" className="underline text-primary">huggingface.co/settings/tokens</a> (must have WRITE permissions).
+                          {t("workspace.hfTokenHelp")}
                         </p>
                       </div>
                       <div className="space-y-2">
-                        <Label htmlFor="hf-dataset">Dataset Name</Label>
+                        <Label htmlFor="hf-dataset">{t("workspace.hfDatasetName")}</Label>
                         <Input
                           id="hf-dataset"
                           placeholder="dataset-name"
@@ -2238,19 +3280,34 @@ const DataLabelingWorkspace = () => {
                           onChange={(e) => setHfDatasetName(e.target.value)}
                         />
                       </div>
+
+                      {/* Progress bar */}
+                      {isPublishing && publishProgress && (
+                        <div className="space-y-1 pt-1">
+                          <div className="flex items-center justify-between text-xs text-muted-foreground">
+                            <span>{publishProgress.step}</span>
+                            <span>{publishProgress.pct}%</span>
+                          </div>
+                          <Progress value={publishProgress.pct} className="h-2" />
+                        </div>
+                      )}
+
+                      {uploadError && (
+                        <p className="text-xs text-destructive">{uploadError}</p>
+                      )}
                     </div>
                     <DialogFooter>
-                      <Button variant="outline" onClick={() => setShowHFDialog(false)}>Cancel</Button>
+                      <Button variant="outline" onClick={() => setShowHFDialog(false)} disabled={isPublishing}>{t("common.cancel")}</Button>
                       <Button onClick={publishToHuggingFace} disabled={isPublishing}>
                         {isPublishing ? (
                           <>
                             <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                            Publishing...
+                            {t("workspace.publishing")}
                           </>
                         ) : (
                           <>
                             <Upload className="w-4 h-4 mr-2" />
-                            Publish
+                            {t("workspace.publish")}
                           </>
                         )}
                       </Button>
@@ -2264,14 +3321,14 @@ const DataLabelingWorkspace = () => {
                     <DialogHeader>
                       <DialogTitle className="flex items-center gap-2">
                         <Check className="w-5 h-5 text-green-500" />
-                        Published Successfully
+                        {t("workspace.publishedSuccessfully")}
                       </DialogTitle>
                       <DialogDescription>
-                        Your dataset has been published to Hugging Face.
+                        {t("workspace.publishedSuccessDesc")}
                       </DialogDescription>
                     </DialogHeader>
                     <div className="py-4">
-                      <p className="text-sm text-muted-foreground mb-2">View your dataset at:</p>
+                      <p className="text-sm text-muted-foreground mb-2">{t("workspace.viewDatasetAt")}</p>
                       <a
                         href={publishedUrl}
                         target="_blank"
@@ -2282,7 +3339,7 @@ const DataLabelingWorkspace = () => {
                       </a>
                     </div>
                     <DialogFooter>
-                      <Button onClick={() => setShowPublishSuccessDialog(false)}>Close</Button>
+                      <Button onClick={() => setShowPublishSuccessDialog(false)}>{t("common.close")}</Button>
                     </DialogFooter>
                   </DialogContent>
                 </Dialog>
@@ -2296,6 +3353,20 @@ const DataLabelingWorkspace = () => {
                     onRestore={handleRestoreVersion}
                   />
                 )}
+
+                {/* Annotation Quality Dashboard Dialog */}
+                {projectId && (isAdmin || isManagerForProject) && (
+                  <Dialog open={showQualityDialog} onOpenChange={setShowQualityDialog}>
+                    <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
+                      <DialogHeader>
+                        <DialogTitle>{t("workspace.quality")}</DialogTitle>
+                        <DialogDescription>{t("quality.dialogDesc")}</DialogDescription>
+                      </DialogHeader>
+                      <AnnotationQualityDashboard projectId={projectId} />
+                    </DialogContent>
+                  </Dialog>
+                )}
+
 
                 {/* Completion Celebration Dialog */}
                 <Dialog
@@ -2312,7 +3383,7 @@ const DataLabelingWorkspace = () => {
                     <DialogHeader>
                       <DialogTitle className="flex items-center gap-2 text-center">
                         <Trophy className="w-6 h-6 text-yellow-500" />
-                        Congratulations! Task Complete!
+                        {t("workspace.congratulations")}
                         <PartyPopper className="w-6 h-6 text-purple-500" />
                       </DialogTitle>
                     </DialogHeader>
@@ -2322,10 +3393,10 @@ const DataLabelingWorkspace = () => {
                         <div className="text-6xl">🎉</div>
                         <div className="space-y-2">
                           <p className="text-lg font-semibold text-green-600">
-                            100% Complete!
+                            {t("workspace.hundredPercent")}
                           </p>
                           <p className="text-muted-foreground">
-                            You've successfully annotated all {dataPoints.length} data points
+                            {t("workspace.allAnnotated", { count: dataPoints.length })}
                           </p>
                         </div>
                       </div>
@@ -2334,19 +3405,19 @@ const DataLabelingWorkspace = () => {
                       <div className="grid grid-cols-2 gap-4 p-4 bg-muted/50 rounded-lg">
                         <div className="text-center">
                           <div className="text-lg font-bold text-green-600">{annotationStats.totalAccepted}</div>
-                          <div className="text-xs text-muted-foreground">Accepted</div>
+                          <div className="text-xs text-muted-foreground">{t("workspace.accepted")}</div>
                         </div>
                         <div className="text-center">
                           <div className="text-lg font-bold text-orange-600">{annotationStats.totalEdited}</div>
-                          <div className="text-xs text-muted-foreground">Edited</div>
+                          <div className="text-xs text-muted-foreground">{t("workspace.edited")}</div>
                         </div>
                         <div className="text-center">
                           <div className="text-lg font-bold text-blue-600">{formatTime(annotationStats.sessionTime)}</div>
-                          <div className="text-xs text-muted-foreground">Time</div>
+                          <div className="text-xs text-muted-foreground">{t("workspace.time")}</div>
                         </div>
                         <div className="text-center">
                           <div className="text-lg font-bold text-purple-600">{getAnnotationRate()}/hr</div>
-                          <div className="text-xs text-muted-foreground">Rate</div>
+                          <div className="text-xs text-muted-foreground">{t("workspace.rate")}</div>
                         </div>
                       </div>
 
@@ -2358,7 +3429,7 @@ const DataLabelingWorkspace = () => {
                           title={!canUpload ? "Requires manager or admin role" : undefined}
                         >
                           <Upload className="w-4 h-4 mr-2" />
-                          Start New Task
+                          {t("workspace.startNewTask")}
                         </Button>
 
                         <div className="grid grid-cols-2 gap-3">
@@ -2368,7 +3439,7 @@ const DataLabelingWorkspace = () => {
                             disabled={!canExport}
                           >
                             <Download className="w-4 h-4 mr-2" />
-                            Export Results
+                            {t("workspace.exportResults")}
                           </Button>
 
                           <Button
@@ -2379,118 +3450,77 @@ const DataLabelingWorkspace = () => {
                             }}
                           >
                             <RotateCcw className="w-4 h-4 mr-2" />
-                            Review Again
+                            {t("workspace.reviewAgain")}
                           </Button>
                         </div>
 
                         <p className="text-xs text-muted-foreground pt-2">
-                          Great job! Your annotations have been saved and are ready for export.
+                          {t("workspace.greatJob")}
                         </p>
                       </div>
                     </div>
                   </DialogContent>
                 </Dialog>
 
-                {/* Navigation */}
-                {dataPoints.length > 0 && viewMode === 'record' && (
-                  <>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={navigatePrevious}
-                      disabled={useFilteredNavigation ? !scopedHasPrevious : currentIndex === 0}
-                    >
-                      <ChevronLeft className="w-4 h-4" />
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={navigateNext}
-                      disabled={useFilteredNavigation ? !scopedHasNext : currentIndex === dataPoints.length - 1}
-                    >
-                      <ChevronRight className="w-4 h-4" />
-                    </Button>
-                  </>
-                )}
-
-
-                {/* Start New Task Button (shows after completion) */}
-                {showCompletionButton && viewMode === 'record' && (
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        variant="default"
-                        size="sm"
-                        onClick={handleStartNewTask}
-                        className="bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700"
-                        disabled={!canUpload}
-                      >
-                        <Upload className="w-4 h-4 mr-2" />
-                        Start New Task
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>Upload a new file to start annotating</TooltipContent>
-                  </Tooltip>
-                )}
-
-                {viewMode === 'record' && (
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button variant="outline" size="sm" onClick={() => setShowShortcuts(true)}>
-                        <Keyboard className="w-4 h-4" />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>Keyboard Shortcuts (?)</TooltipContent>
-                  </Tooltip>
-                )}
-
-                {/* Export Results */}
-                {dataPoints.length > 0 && viewMode === 'record' && (
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button variant="outline" size="sm" onClick={openExportDialog} disabled={!canExport}>
-                        <Download className="w-4 h-4" />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>Export Results</TooltipContent>
-                  </Tooltip>
-                )}
-              </div>
-              <div className="ml-2">
-                <ThemeToggle />
-                <UserMenu />
-              </div>
-            </div>
-          </div>
-        </div>
-
         {/* Main Content */}
-        <div className="flex-1 pt-20 p-6">
+        <div className="flex-1 pt-16 p-6">
           {dataPoints.length === 0 ? (
             <div className="h-full flex items-center justify-center">
-              <Card className="p-8 text-center max-w-md">
-                <FileText className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
-                <h3 className="text-lg font-semibold mb-2">No Data Loaded</h3>
-                <p className="text-muted-foreground mb-4">
-                  Upload a data file to start labeling. Supports JSON, CSV, and TXT formats.
+              <div className="w-full max-w-4xl space-y-6">
+                <div className="text-center">
+                  <h3 className="text-xl font-semibold mb-2">{t("workspace.importDataToStart")}</h3>
+                  <p className="text-muted-foreground">
+                    {t("workspace.importDataDesc")}
+                  </p>
+                </div>
+
+                {/* Unified import button */}
+                <div className="flex justify-center">
+                  <Button
+                    size="lg"
+                    disabled={isWizardUploading || !canUpload}
+                    title={!canUpload ? "Requires manager or admin role" : undefined}
+                    onClick={openWizard}
+                    className="gap-2 px-8"
+                  >
+                    {isWizardUploading
+                      ? <><Loader2 className="w-5 h-5 animate-spin" /> {t("importWizard.importing")}</>
+                      : <><Upload className="w-5 h-5" /> {t("workspace.importDataButton")}</>
+                    }
+                  </Button>
+                </div>
+                <p className="text-xs text-center text-muted-foreground -mt-1">
+                  {t("workspace.importDataSupports")}
                 </p>
-                <Button
-                  disabled={isUploading || !canUpload}
-                  title={!canUpload ? "Requires manager or admin role" : undefined}
-                  onClick={() => document.getElementById('file-upload-main')?.click()}
-                >
-                  {isUploading ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Upload className="w-4 h-4 mr-2" />}
-                  Upload File
-                </Button>
-                <input
-                  id="file-upload-main"
-                  type="file"
-                  accept=".json,.csv,.txt"
-                  onChange={handleFileUpload}
-                  disabled={!canUpload}
-                  className="hidden"
-                />
-              </Card>
+
+                {/* Setup checklist */}
+                {canUpload && (
+                  <div className="rounded-lg border bg-muted/30 px-5 py-4">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-3">{t("workspace.projectSetupChecklist")}</p>
+                    <ol className="space-y-2 text-sm">
+                      <li className="flex items-center gap-2.5">
+                        <span className="w-5 h-5 rounded-full bg-amber-500 text-white text-xs flex items-center justify-center font-bold flex-shrink-0">1</span>
+                        <span className="font-medium">{t("workspace.importDataset_step")}</span>
+                        <span className="text-muted-foreground">{t("workspace.youAreHere")}</span>
+                      </li>
+                      <li className="flex items-center gap-2.5 text-muted-foreground">
+                        <span className="w-5 h-5 rounded-full border text-xs flex items-center justify-center font-bold flex-shrink-0">2</span>
+                        <span>{t("workspace.configAnnotationForm")}</span>
+                        <Button variant="link" size="sm" className="h-auto p-0 text-xs" onClick={() => navigate(`/projects/${projectId}/settings`)}>
+                          {t("workspace.goToSettings")}
+                        </Button>
+                      </li>
+                      <li className="flex items-center gap-2.5 text-muted-foreground">
+                        <span className="w-5 h-5 rounded-full border text-xs flex items-center justify-center font-bold flex-shrink-0">3</span>
+                        <span>{t("workspace.addAnnotators")}</span>
+                        <Button variant="link" size="sm" className="h-auto p-0 text-xs" onClick={() => navigate(`/projects/${projectId}/settings`)}>
+                          {t("workspace.goToSettings")}
+                        </Button>
+                      </li>
+                    </ol>
+                  </div>
+                )}
+              </div>
             </div>
           ) : (
             <div className="flex gap-6 h-full">
@@ -2498,22 +3528,47 @@ const DataLabelingWorkspace = () => {
               <div className="flex-1 overflow-y-auto pb-10 min-w-0">
                 <div className="space-y-6">
                   {viewMode === 'record' ? (
+                    <>
+                    {/* ── Text Classification mode ─────────────────────────────── */}
+                    {projectAccess?.taskType === 'text_classification' && currentDataPoint ? (
+                      <TextClassificationView
+                        dataPoint={currentDataPoint}
+                        currentIndex={currentIndex}
+                        total={dataPoints.length}
+                        annotationConfig={annotationConfig}
+                        selectedLabel={
+                          // Prefer customFieldValues, fall back to humanAnnotation
+                          (Object.values(currentDataPoint.customFieldValues ?? {})[0] as string) ||
+                          currentDataPoint.humanAnnotation || ''
+                        }
+                        onSelectLabel={(label) => {
+                          handleHumanAnnotationChange(label, annotatorMeta);
+                          handleAcceptAnnotation(label, annotatorMeta);
+                          if (currentIndex < dataPoints.length - 1) handleNext();
+                        }}
+                        onNext={() => handleNext()}
+                        onPrev={() => handlePrevious()}
+                      />
+                    ) : (
                     <div className="flex gap-4">
                       {/* Main Content */}
                       <div className="flex-1">
                         <Card className="min-h-full p-6">
                           <div className="space-y-6">
                             <div className="flex items-center justify-between">
-                              <h2 className="text-lg font-semibold">Data Point</h2>
-                              <Badge variant={currentDataPoint?.status === 'accepted' ? 'default' :
-                                currentDataPoint?.status === 'edited' ? 'secondary' :
-                                  currentDataPoint?.status === 'ai_processed' ? 'outline' : 'destructive'}>
-                                {currentDataPoint?.status?.replace('_', ' ')}
-                              </Badge>
+                              <h2 className="text-lg font-semibold">{t("workspace.dataPoint")}</h2>
+                              {currentDataPoint && (() => {
+                                const displayStatus = getDisplayStatus(currentDataPoint);
+                                return (
+                                  <Badge variant={getStatusVariant(displayStatus.code)}>
+                                    {displayStatus.label}
+                                  </Badge>
+                                );
+                              })()}
                             </div>
 
                             <div className="bg-muted/50 p-4 rounded-lg">
-                              <Label className="text-sm font-medium">Original Content</Label>
+                              <Label className="text-sm font-medium">{t("workspace.originalContent")}</Label>
                               {currentDataPoint?.type === 'image' ? (
                                 <div className="mt-2">
                                   <img
@@ -2524,6 +3579,15 @@ const DataLabelingWorkspace = () => {
                                       (e.target as HTMLImageElement).src = 'https://placehold.co/600x400?text=Image+Not+Found';
                                     }}
                                   />
+                                </div>
+                              ) : currentDataPoint?.type === 'audio' ? (
+                                <div className="mt-2 space-y-2">
+                                  <audio controls src={getPlayableAudioSource(currentDataPoint.content) || ''} className="w-full">
+                                    {t("workspace.browserNoAudio")}
+                                  </audio>
+                                  <p className="text-xs text-muted-foreground break-all">
+                                    {currentDataPoint.metadata?.filename || currentDataPoint.content}
+                                  </p>
                                 </div>
                               ) : (
                                 <p className="mt-2 text-foreground leading-relaxed whitespace-pre-wrap">
@@ -2552,12 +3616,14 @@ const DataLabelingWorkspace = () => {
                             <div className="space-y-4">
                               <div className="flex items-center gap-2">
                                 <Bot className="w-5 h-5 text-purple-600" />
-                                <h3 className="font-semibold">Model Arena</h3>
+                                <h3 className="font-semibold">{t("workspace.modelArena")}</h3>
                               </div>
 
                               <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                                 {/* AI Provider Cards */}
-                                {Object.entries(currentDataPoint?.aiSuggestions || {}).map(([modelProfileId, suggestion]) => {
+                                {(() => {
+                                  const aiFormFieldIds = new Set((annotationConfig?.fields ?? []).map(f => f.id));
+                                  return Object.entries(currentDataPoint?.aiSuggestions || {}).map(([modelProfileId, suggestion]) => {
                                   const profile = profileById.get(modelProfileId);
                                   const connection = profile ? connectionById.get(profile.providerConnectionId) : null;
                                   const provider = connection ? availableProviders.find(p => p.id === connection.providerId) : null;
@@ -2582,25 +3648,40 @@ const DataLabelingWorkspace = () => {
                                             variant="secondary"
                                             className="h-7 text-xs"
                                             onClick={() => handleEditAnnotation(suggestion)}
+                                            disabled={!canAnnotateCurrent}
                                           >
                                             <Edit3 className="w-3 h-3 mr-1" />
-                                            Edit
+                                            {t("common.edit")}
                                           </Button>
                                           <Button
                                             size="sm"
                                             className="h-7 text-xs"
                                             onClick={() => handleAcceptAnnotation(suggestion, annotatorMeta)}
+                                            disabled={!canAnnotateCurrent}
                                           >
                                             <Check className="w-3 h-3 mr-1" />
-                                            Use This
+                                            {t("workspace.useThis")}
                                           </Button>
                                         </div>
                                       </div>
-                                      <p className="text-sm text-foreground whitespace-pre-wrap mb-3">{suggestion}</p>
+                                      {annotationConfig && annotationConfig.fields.length > 0 ? (
+                                        <div className="mb-3">
+                                          <DynamicAnnotationForm
+                                            fields={annotationConfig.fields}
+                                            values={parseAiSuggestionToFieldValues(suggestion, aiFormFieldIds)}
+                                            onChange={() => {}}
+                                            metadata={currentDataPoint?.metadata}
+                                            sourceText={currentDataPoint?.content}
+                                            readOnly
+                                          />
+                                        </div>
+                                      ) : (
+                                        <p className="text-sm text-foreground whitespace-pre-wrap mb-3">{suggestion}</p>
+                                      )}
 
                                       {/* Star Rating */}
                                       <div className="flex items-center gap-2 pt-2 border-t border-purple-200 dark:border-purple-800">
-                                        <span className="text-xs text-muted-foreground">Rate output:</span>
+                                        <span className="text-xs text-muted-foreground">{t("workspace.rateOutput")}</span>
                                         <div className="flex items-center">
                                           {[1, 2, 3, 4, 5].map((star) => (
                                             <button
@@ -2620,38 +3701,26 @@ const DataLabelingWorkspace = () => {
                                       </div>
                                     </Card>
                                   );
-                                })}
+                                });
+                                })()}
 
                                 {/* Human Annotation Card - Now using Dynamic Form */}
                                 <Card className="p-4 border-blue-200 dark:border-blue-800 bg-blue-50/30 dark:bg-blue-950/10 transition-all hover:shadow-md">
                                   <div className="flex items-center justify-between mb-3">
                                     <Badge variant="outline" className="bg-background flex items-center gap-1">
                                       <User className="w-3 h-3" />
-                                      Human Annotation
+                                      {t("workspace.humanAnnotation")}
                                     </Badge>
                                     <div className="flex gap-2">
-                                      <Tooltip>
-                                        <TooltipTrigger asChild>
-                                          <Button
-                                            size="sm"
-                                            variant="ghost"
-                                            className="h-7 text-xs"
-                                            onClick={openXmlEditor}
-                                          >
-                                            <FileText className="w-3 h-3 mr-1" />
-                                            Customize
-                                          </Button>
-                                        </TooltipTrigger>
-                                        <TooltipContent>Customize annotation fields</TooltipContent>
-                                      </Tooltip>
-                                      {currentDataPoint?.humanAnnotation && (
+                                      {getVisibleDraftAnnotation(currentDataPoint) && (
                                         <Button
                                           size="sm"
                                           className="h-7 text-xs"
-                                          onClick={() => handleAcceptAnnotation(currentDataPoint.humanAnnotation!, annotatorMeta)}
+                                          onClick={() => handleAcceptAnnotation(getVisibleDraftAnnotation(currentDataPoint), annotatorMeta)}
+                                          disabled={!canAnnotateCurrent}
                                         >
                                           <Check className="w-3 h-3 mr-1" />
-                                          Use This
+                                          {t("workspace.useThis")}
                                         </Button>
                                       )}
                                     </div>
@@ -2664,6 +3733,7 @@ const DataLabelingWorkspace = () => {
                                         values={currentDataPoint?.customFieldValues || {}}
                                         onChange={handleCustomFieldValueChange}
                                         metadata={currentDataPoint?.metadata}
+                                        sourceText={currentDataPoint?.content}
                                       />
                                       <div className="flex justify-end mt-3">
                                         <Button
@@ -2677,31 +3747,30 @@ const DataLabelingWorkspace = () => {
                                             handleAcceptAnnotation(annotation, annotatorMeta);
                                           }}
                                           className="bg-green-600 hover:bg-green-700"
-                                          disabled={
-                                            // Disable if any required field is empty
-                                            annotationConfig?.fields.some(field =>
+                                          disabled={!canAnnotateCurrent ||
+                                            (annotationConfig?.fields.some(field =>
                                               field.required &&
                                               !currentDataPoint?.customFieldValues?.[field.id]
-                                            ) ?? false
-                                          }
+                                            ) ?? false)}
                                         >
                                           <Check className="w-4 h-4 mr-2" />
-                                          Submit Annotation
+                                          {t("workspace.submitAnnotation")}
                                         </Button>
                                       </div>
                                     </>
                                   ) : (
                                     <Textarea
-                                      value={currentDataPoint?.humanAnnotation || ''}
-                                      onChange={(e) => handleHumanAnnotationChange(e.target.value)}
-                                      placeholder="Type your own annotation here..."
+                                      value={getVisibleDraftAnnotation(currentDataPoint) || ''}
+                                      onChange={(e) => handleHumanAnnotationChange(e.target.value, annotatorMeta)}
+                                      placeholder={t("workspace.typeAnnotationHere")}
                                       className="min-h-[100px] mb-2 bg-background/50"
+                                      disabled={!canAnnotateCurrent}
                                     />
                                   )}
                                   <p className="text-xs text-muted-foreground mt-2">
                                     {annotationConfig && annotationConfig.fields.length > 0
-                                      ? 'Fill in the fields above, then click "Submit Annotation" to mark complete.'
-                                      : 'Your manual annotation. Click "Use This" to set it as final.'
+                                      ? t("workspace.fillFieldsPrompt")
+                                      : t("workspace.useThisPrompt")
                                     }
                                   </p>
                                 </Card>
@@ -2711,7 +3780,7 @@ const DataLabelingWorkspace = () => {
                             {/* Edit Mode Area */}
                             {isEditMode && (
                               <div className="bg-background p-4 rounded-lg border-2 border-primary animate-in fade-in zoom-in-95 duration-200">
-                                <Label className="text-sm font-medium mb-2 block">Edit Annotation</Label>
+                                <Label className="text-sm font-medium mb-2 block">{t("workspace.editAnnotation")}</Label>
                                 <Textarea
                                   value={tempAnnotation}
                                   onChange={(e) => setTempAnnotation(e.target.value)}
@@ -2721,35 +3790,117 @@ const DataLabelingWorkspace = () => {
                                 />
                                 <div className="flex gap-2 justify-end">
                                   <Button size="sm" variant="outline" onClick={() => setIsEditMode(false)}>
-                                    Cancel
+                                    {t("common.cancel")}
                                   </Button>
                                   <Button size="sm" onClick={() => handleSaveEdit(annotatorMeta)}>
                                     <Save className="w-4 h-4 mr-2" />
-                                    Save Changes
+                                    {t("workspace.saveChanges")}
                                   </Button>
                                 </div>
                               </div>
                             )}
 
                             {/* Final Annotation Display */}
-                            {currentDataPoint?.finalAnnotation && !isEditMode && (
+                            {getVisibleFinalAnnotation(currentDataPoint) && !isEditMode && (
                               <div className="bg-green-50 dark:bg-green-950/20 p-4 rounded-lg border border-green-200 dark:border-green-800 animate-in fade-in slide-in-from-bottom-2">
                                 <div className="flex items-center justify-between mb-2">
                                   <div className="flex items-center gap-2">
                                     <CheckCircle className="w-4 h-4 text-green-700 dark:text-green-300" />
-                                    <Label className="text-sm font-medium text-green-700 dark:text-green-300">Final Selected Annotation</Label>
+                                    <Label className="text-sm font-medium text-green-700 dark:text-green-300">{t("workspace.finalSelectedAnnotation")}</Label>
                                   </div>
                                   <Button
                                     variant="ghost"
                                     size="sm"
                                     className="h-6 text-xs text-green-700 hover:text-green-800 hover:bg-green-100"
-                                    onClick={() => handleEditAnnotation(currentDataPoint.finalAnnotation!)}
+                                    onClick={() => handleEditAnnotation(getVisibleFinalAnnotation(currentDataPoint))}
+                                    disabled={!canAnnotateCurrent}
                                   >
                                     <Edit3 className="w-3 h-3 mr-1" />
-                                    Edit
+                                    {t("common.edit")}
                                   </Button>
                                 </div>
-                                <p className="text-foreground whitespace-pre-wrap">{currentDataPoint.finalAnnotation}</p>
+                                <p className="text-foreground whitespace-pre-wrap">{getVisibleFinalAnnotation(currentDataPoint)}</p>
+                              </div>
+                            )}
+
+                            {isAnnotatorForProject && currentDataPoint && (annotatorCanViewCompleted || (!currentDataPoint.isIAA && getDoneCount(currentDataPoint) > 0)) && (
+                              <div className="bg-slate-50 dark:bg-slate-950/20 p-4 rounded-lg border border-slate-200 dark:border-slate-800">
+                                <div className="flex items-center gap-2 mb-3">
+                                  <CheckCircle className="w-4 h-4 text-slate-600" />
+                                  <Label className="text-sm font-medium">{t("workspace.completedAnnotations")}</Label>
+                                </div>
+                                <div className="space-y-2">
+                                  {currentDataPoint.assignments && currentDataPoint.assignments.length > 0 ? (
+                                    currentDataPoint.assignments.filter(a => a.status === 'done' && (a.value ?? '').trim().length > 0).map((assignment, idx) => {
+                                      const user = getUserById(assignment.annotatorId);
+                                      return (
+                                        <div key={`${assignment.annotatorId}-${idx}`} className="rounded-md border border-border/60 bg-background p-3">
+                                          <div className="flex items-center justify-between">
+                                            <div className="text-sm font-medium">
+                                              {user?.username || assignment.annotatorId}
+                                            </div>
+                                            <Badge variant={assignment.status === 'done' ? "default" : "outline"}>
+                                              {assignment.status === 'done' ? t('workspace.statusDone') : assignment.status === 'in_progress' ? t('workspace.statusInProgress') : t('workspace.statusPending')}
+                                            </Badge>
+                                          </div>
+                                          <p className="mt-2 text-sm text-foreground whitespace-pre-wrap">
+                                            {assignment.value || <span className="text-muted-foreground">{t("workspace.noAnnotationYet")}</span>}
+                                          </p>
+                                        </div>
+                                      );
+                                    })
+                                  ) : (
+                                    <div className="rounded-md border border-dashed border-border p-3 text-sm text-muted-foreground">
+                                      {t("workspace.noAnnotatorRecords")}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            )}
+
+                            {canViewIaaDetails && currentDataPoint?.isIAA && (
+                              <div className="bg-slate-50 dark:bg-slate-950/20 p-4 rounded-lg border border-slate-200 dark:border-slate-800">
+                                <div className="flex items-center justify-between mb-3">
+                                  <div className="flex items-center gap-2">
+                                    <Target className="w-4 h-4 text-slate-600" />
+                                    <Label className="text-sm font-medium">{t("workspace.iaaAnnotationDetails")}</Label>
+                                  </div>
+                                  <div className="flex items-center gap-2">
+                                    <Badge variant={currentDataPoint.isIAA ? "default" : "secondary"}>
+                                      {currentDataPoint.isIAA ? "IAA" : t('workspace.notIAA')}
+                                    </Badge>
+                                    <Badge variant="outline">
+                                      {t('workspace.iaaCountDone', { done: getDoneCount(currentDataPoint), required: getIaaRequiredCount(currentDataPoint) })}
+                                    </Badge>
+                                  </div>
+                                </div>
+
+                                <div className="space-y-2">
+                                  {currentDataPoint.assignments && currentDataPoint.assignments.length > 0 ? (
+                                    currentDataPoint.assignments.map((assignment, idx) => {
+                                      const user = getUserById(assignment.annotatorId);
+                                      return (
+                                        <div key={`${assignment.annotatorId}-${idx}`} className="rounded-md border border-border/60 bg-background p-3">
+                                          <div className="flex items-center justify-between">
+                                            <div className="text-sm font-medium">
+                                              {user?.username || assignment.annotatorId}
+                                            </div>
+                                            <Badge variant={assignment.status === 'done' ? "default" : "outline"}>
+                                              {assignment.status === 'done' ? t('workspace.statusDone') : assignment.status === 'in_progress' ? t('workspace.statusInProgress') : t('workspace.statusPending')}
+                                            </Badge>
+                                          </div>
+                                          <p className="mt-2 text-sm text-foreground whitespace-pre-wrap">
+                                            {assignment.value || <span className="text-muted-foreground">{t("workspace.noAnnotationYet")}</span>}
+                                          </p>
+                                        </div>
+                                      );
+                                    })
+                                  ) : (
+                                    <div className="rounded-md border border-dashed border-border p-3 text-sm text-muted-foreground">
+                                      {t("workspace.noAnnotatorRecords")}
+                                    </div>
+                                  )}
+                                </div>
                               </div>
                             )}
 
@@ -2779,93 +3930,292 @@ const DataLabelingWorkspace = () => {
                         </Card>
                       </div>
 
-                      {/* Metadata Sidebar */}
-                      <MetadataSidebar
-                        metadata={currentDataPoint?.displayMetadata || currentDataPoint?.metadata}
-                        isOpen={showMetadataSidebar}
-                        onToggle={() => setShowMetadataSidebar(!showMetadataSidebar)}
-                      />
+                      {/* Stacked sidebar column — fixed header rows, content expands below */}
+                      {(() => {
+                        const isWide = showGuidelinesSidebar || showMetadataSidebar;
+                        const hasMetadata = !!(currentDataPoint?.displayMetadata && Object.keys(currentDataPoint.displayMetadata).length > 0);
+                        return (
+                          <div className={`flex-shrink-0 flex flex-col transition-all duration-300 border border-border rounded-lg overflow-hidden bg-card ${isWide ? 'w-72' : 'w-10'}`}>
+                            {/* Guidelines header row — always visible, never moves */}
+                            <button
+                              className="flex items-center gap-2 h-10 px-3 hover:bg-muted/50 border-b border-border/50 w-full shrink-0 disabled:opacity-40"
+                              onClick={() => setShowGuidelinesSidebar(v => !v)}
+                              disabled={!projectId}
+                            >
+                              <Book className="w-4 h-4 shrink-0 text-purple-500" />
+                              {isWide && <span className="text-xs font-semibold flex-1 text-start truncate">{t("workspace.projectGuidelines")}</span>}
+                              {showGuidelinesSidebar
+                                ? <ChevronUp className="w-3 h-3 shrink-0 text-muted-foreground" />
+                                : <ChevronDown className="w-3 h-3 shrink-0 text-muted-foreground" />}
+                            </button>
+                            {/* Guidelines content */}
+                            {showGuidelinesSidebar && (
+                              <GuidelinesSidebar project={projectAccess} />
+                            )}
+
+                            {/* Metadata header row — always visible, never moves */}
+                            {hasMetadata && (
+                              <>
+                                <button
+                                  className="flex items-center gap-2 h-10 px-3 hover:bg-muted/50 border-b border-border/50 w-full shrink-0"
+                                  onClick={() => setShowMetadataSidebar(v => !v)}
+                                >
+                                  <FileText className="w-4 h-4 shrink-0 text-muted-foreground" />
+                                  {isWide && <span className="text-xs font-semibold flex-1 text-start truncate">{t("workspace.metadata")}</span>}
+                                  {showMetadataSidebar
+                                    ? <ChevronUp className="w-3 h-3 shrink-0 text-muted-foreground" />
+                                    : <ChevronDown className="w-3 h-3 shrink-0 text-muted-foreground" />}
+                                </button>
+                                {/* Metadata content */}
+                                {showMetadataSidebar && (
+                                  <MetadataSidebar metadata={currentDataPoint?.displayMetadata} />
+                                )}
+                              </>
+                            )}
+                          </div>
+                        );
+                      })()}
                     </div>
+                    )}
+                    {/* ── End of text-classification / default view ── */}
+                    <Card className="p-6 mt-4 space-y-3">
+                      <div className="flex items-center gap-2">
+                        <MessageSquare className="w-4 h-4 text-blue-500" />
+                        <Label className="text-sm font-medium">{t("workspace.comments")}</Label>
+                      </div>
+
+                      <div className="space-y-2">
+                        <Textarea
+                          value={commentDraft}
+                          onChange={(e) => setCommentDraft(e.target.value)}
+                          placeholder={t("workspace.addCommentPlaceholder")}
+                          className="min-h-[88px]"
+                          disabled={!canCommentOnCurrent}
+                        />
+                        <Button
+                          size="sm"
+                          className="w-full sm:w-auto"
+                          onClick={handleCreateComment}
+                          disabled={!canCommentOnCurrent || !commentDraft.trim()}
+                        >
+                          {t("workspace.addComment")}
+                        </Button>
+                      </div>
+
+                      <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+                        {commentsLoading ? (
+                          <p className="text-xs text-muted-foreground">{t("workspace.loadingComments")}</p>
+                        ) : comments.length === 0 ? (
+                          <p className="text-xs text-muted-foreground">{t("workspace.noComments")}</p>
+                        ) : (
+                          comments.map(comment => (
+                            <div key={comment.id} className="rounded-md border border-border/70 bg-muted/30 p-3 space-y-2">
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="min-w-0">
+                                  <p className="text-xs font-medium truncate">{comment.authorName}</p>
+                                  <p className="text-[11px] text-muted-foreground">
+                                    {formatCommentTime(comment.createdAt)}{comment.isEdited ? ' . edited' : ''}
+                                  </p>
+                                </div>
+                                <div className="flex items-center gap-1">
+                                  {canEditComment(comment) && editingCommentId !== comment.id && (
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      className="h-6 px-2 text-xs"
+                                      onClick={() => startEditComment(comment)}
+                                    >
+                                      {t("common.edit")}
+                                    </Button>
+                                  )}
+                                  {canDeleteComment(comment) && (
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      className="h-6 px-2 text-xs text-destructive"
+                                      onClick={() => handleDeleteComment(comment.id)}
+                                    >
+                                      <Trash2 className="w-3 h-3" />
+                                    </Button>
+                                  )}
+                                </div>
+                              </div>
+
+                              {editingCommentId === comment.id ? (
+                                <div className="space-y-2">
+                                  <Textarea
+                                    value={editingCommentBody}
+                                    onChange={(e) => setEditingCommentBody(e.target.value)}
+                                    className="min-h-[72px]"
+                                  />
+                                  <div className="flex items-center gap-2">
+                                    <Button
+                                      size="sm"
+                                      className="h-7 text-xs"
+                                      onClick={() => handleUpdateComment(comment.id)}
+                                      disabled={!editingCommentBody.trim()}
+                                    >
+                                      {t("common.save")}
+                                    </Button>
+                                    <Button
+                                      size="sm"
+                                      variant="outline"
+                                      className="h-7 text-xs"
+                                      onClick={cancelEditComment}
+                                    >
+                                      {t("common.cancel")}
+                                    </Button>
+                                  </div>
+                                </div>
+                              ) : (
+                                <p className="text-xs whitespace-pre-wrap break-words">{comment.body}</p>
+                              )}
+                            </div>
+                          ))
+                        )}
+                      </div>
+
+                      <div className="flex items-center justify-between text-xs text-muted-foreground">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 px-2"
+                          onClick={() => loadComments(Math.max(1, commentsPage - 1))}
+                          disabled={commentsPage <= 1 || commentsLoading}
+                        >
+                          {isRTL ? <ChevronRight className="w-3 h-3" /> : <ChevronLeft className="w-3 h-3" />}
+                        </Button>
+                        <span>{t("workspace.pageOf", { page: commentsPage, total: commentsTotalPages })}</span>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 px-2"
+                          onClick={() => loadComments(Math.min(commentsTotalPages, commentsPage + 1))}
+                          disabled={commentsPage >= commentsTotalPages || commentsLoading}
+                        >
+                          {isRTL ? <ChevronLeft className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                        </Button>
+                      </div>
+                    </Card>
+                    </>
                   ) : (
                     <Card className="p-6">
                       <div className="flex flex-col gap-4 min-w-0">
                         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                           <div>
-                            <h3 className="text-lg font-semibold">Annotation Overview</h3>
+                            <h3 className="text-lg font-semibold">{t("workspace.annotationOverview")}</h3>
                             <p className="text-xs text-muted-foreground">
-                              Browse annotations across all data points.
+                              {t("workspace.browseAnnotations")}
                             </p>
                           </div>
                           <Badge variant="secondary" className="w-fit">
-                            {filteredAnnotationEntries.length} total
+                            {t("workspace.totalBadge", { count: globalFilteredCount })}
                           </Badge>
                         </div>
 
-                        <div className="grid grid-cols-1 gap-3 lg:grid-cols-[2fr_1fr_1fr_1fr]">
+                        <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
                           <div className="space-y-1">
-                            <Label htmlFor="annotation-search" className="text-xs text-muted-foreground">Search</Label>
+                            <Label htmlFor="annotation-search" className="text-xs text-muted-foreground">{t("common.search")}</Label>
                             <Input
                               id="annotation-search"
                               value={annotationQuery}
                               onChange={(e) => setAnnotationQuery(e.target.value)}
-                              placeholder="Search content, annotations, or metadata..."
+                              placeholder={t("workspace.searchPlaceholder")}
                             />
                           </div>
 
                           <div className="space-y-1">
-                            <Label className="text-xs text-muted-foreground">Status</Label>
+                            <Label className="text-xs text-muted-foreground">{t("common.status")}</Label>
                             <Select
                               value={annotationStatusFilter}
                               onValueChange={(value) => setAnnotationStatusFilter(value as AnnotationStatusFilter)}
                             >
                               <SelectTrigger>
-                                <SelectValue placeholder="All statuses" />
+                                <SelectValue placeholder={t("workspace.allStatuses")} />
                               </SelectTrigger>
                               <SelectContent>
-                                <SelectItem value="all">All statuses</SelectItem>
-                                <SelectItem value="has_final">Has final annotation</SelectItem>
-                                <SelectItem value="accepted">Accepted</SelectItem>
-                                <SelectItem value="edited">Edited</SelectItem>
-                                <SelectItem value="ai_processed">AI processed</SelectItem>
-                                <SelectItem value="pending">Pending</SelectItem>
-                                <SelectItem value="rejected">Rejected</SelectItem>
+                                <SelectItem value="all">{t("workspace.allStatuses")}</SelectItem>
+                                <SelectItem value="has_final">{t("workspace.hasFinalAnnotation")}</SelectItem>
+                                <SelectItem value="accepted">{t("workspace.accepted")}</SelectItem>
+                                <SelectItem value="edited">{t("workspace.edited")}</SelectItem>
+                                <SelectItem value="ai_processed">{t("workspace.aiProcessed")}</SelectItem>
+                                <SelectItem value="pending">{t("workspace.status.pending")}</SelectItem>
+                                <SelectItem value="rejected">{t("workspace.status.rejected")}</SelectItem>
                               </SelectContent>
                             </Select>
                           </div>
 
                           <div className="space-y-1">
-                            <Label className="text-xs text-muted-foreground">Page size</Label>
+                            <Label className="text-xs text-muted-foreground">{t("workspace.allAnnotators")}</Label>
+                            <Select
+                              value={annotatedByFilter}
+                              onValueChange={setAnnotatedByFilter}
+                            >
+                              <SelectTrigger>
+                                <SelectValue placeholder={t("workspace.allAnnotators")} />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="all">{t("workspace.allAnnotators")}</SelectItem>
+                                {availableAnnotators.map(annotator => (
+                                  <SelectItem key={annotator.id} value={annotator.id}>
+                                    {annotator.name}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+
+                          <div className="space-y-1">
+                            <Label className="text-xs text-muted-foreground">{t("workspace.allTime")}</Label>
+                            <Select
+                              value={annotatedTimeFilter}
+                              onValueChange={setAnnotatedTimeFilter}
+                            >
+                              <SelectTrigger>
+                                <SelectValue placeholder={t("workspace.allTime")} />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="all">{t("workspace.allTime")}</SelectItem>
+                                <SelectItem value="today">{t("workspace.today")}</SelectItem>
+                                <SelectItem value="this_week">{t("workspace.thisWeek")}</SelectItem>
+                                <SelectItem value="this_month">{t("workspace.thisMonth")}</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+
+                          <div className="space-y-1">
+                            <Label className="text-xs text-muted-foreground">{t("workspace.pageSize")}</Label>
                             <Select
                               value={`${annotationPageSize}`}
                               onValueChange={(value) => setAnnotationPageSize(Number(value))}
                             >
                               <SelectTrigger>
-                                <SelectValue placeholder="12 per page" />
+                                <SelectValue placeholder={t("workspace.perPage", { n: 12 })} />
                               </SelectTrigger>
                               <SelectContent>
-                                <SelectItem value="12">12 per page</SelectItem>
-                                <SelectItem value="36">36 per page</SelectItem>
-                                <SelectItem value="72">72 per page</SelectItem>
+                                <SelectItem value="12">{t("workspace.perPage", { n: 12 })}</SelectItem>
+                                <SelectItem value="36">{t("workspace.perPage", { n: 36 })}</SelectItem>
+                                <SelectItem value="72">{t("workspace.perPage", { n: 72 })}</SelectItem>
                               </SelectContent>
                             </Select>
                           </div>
 
                           <div className="space-y-1">
-                            <Label className="text-xs text-muted-foreground">Layout</Label>
+                            <Label className="text-xs text-muted-foreground">{t("workspace.layout")}</Label>
                             <div className="flex items-center gap-2">
                               <Button
                                 size="sm"
                                 variant={listLayout === 'grid' ? "default" : "outline"}
                                 onClick={() => setListLayout('grid')}
                               >
-                                Grid
+                                {t("workspace.grid")}
                               </Button>
                               <Button
                                 size="sm"
                                 variant={listLayout === 'list' ? "default" : "outline"}
                                 onClick={() => setListLayout('list')}
                               >
-                                List
+                                {t("workspace.list")}
                               </Button>
                             </div>
                           </div>
@@ -2874,7 +4224,7 @@ const DataLabelingWorkspace = () => {
                           <div className="space-y-2">
                             <div className="flex items-center justify-between">
                               <div className="flex items-center gap-2">
-                                <Label className="text-xs text-muted-foreground">Metadata filters</Label>
+                                <Label className="text-xs text-muted-foreground">{t("workspace.metadataFilters")}</Label>
                                 <Button
                                   size="icon"
                                   variant="ghost"
@@ -2893,7 +4243,7 @@ const DataLabelingWorkspace = () => {
                                   variant="ghost"
                                   onClick={() => setMetadataFilters({})}
                                 >
-                                  Clear
+                                  {t("workspace.clearFilters")}
                                 </Button>
                               )}
                             </div>
@@ -2908,8 +4258,8 @@ const DataLabelingWorkspace = () => {
                                           <Label className="text-xs text-muted-foreground">{key}</Label>
                                           <p className="text-[11px] text-muted-foreground">
                                             {selectedValues.length > 0
-                                              ? `${selectedValues.length} selected`
-                                              : 'No selection'}
+                                              ? t("workspace.selected", { count: selectedValues.length })
+                                              : t("workspace.noSelection")}
                                           </p>
                                         </div>
                                         <Popover>
@@ -2932,7 +4282,7 @@ const DataLabelingWorkspace = () => {
                                                     }))
                                                   }
                                                 >
-                                                  Select all
+                                                  {t("workspace.selectAll")}
                                                 </Button>
                                                 <Button
                                                   size="sm"
@@ -2944,7 +4294,7 @@ const DataLabelingWorkspace = () => {
                                                     }))
                                                   }
                                                 >
-                                                  None
+                                                  {t("workspace.none")}
                                                 </Button>
                                               </div>
                                             </div>
@@ -2996,7 +4346,7 @@ const DataLabelingWorkspace = () => {
                         >
                           {paginatedAnnotationEntries.length === 0 ? (
                             <div className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
-                              No annotations match the current filters.
+                              {t("workspace.noAnnotationsMatch")}
                             </div>
                           ) : (
                             paginatedAnnotationEntries.map(({ dataPoint, index }) => {
@@ -3012,70 +4362,125 @@ const DataLabelingWorkspace = () => {
                                   onClick={() => {
                                     setCurrentIndex(index);
                                     setViewMode('record');
-                                    setUseFilteredNavigation(hasActiveFilters);
+                                    setUseFilteredNavigation(isAnnotatorForProject ? true : hasActiveFilters);
                                   }}
                                 >
-                                  {/* Section 1: Badges & Status */}
-                                  <div className={listLayout === 'list' ? "sm:w-[140px] flex-shrink-0" : "w-full"}>
-                                    <div className="flex flex-wrap items-center gap-2 text-xs">
-                                      <Badge
-                                        variant={
-                                          dataPoint.status === 'accepted'
-                                            ? 'default'
-                                            : dataPoint.status === 'edited'
-                                              ? 'secondary'
-                                              : dataPoint.status === 'ai_processed'
-                                                ? 'outline'
-                                                : 'destructive'
-                                        }
-                                      >
-                                        {dataPoint.status.replace('_', ' ')}
-                                      </Badge>
-                                      <Badge variant="outline">
-                                        #{index + 1}
-                                      </Badge>
-                                      {preview.label !== 'None' && (
-                                        <Badge variant="secondary">{preview.label}</Badge>
-                                      )}
-                                      {dataPoint.annotatorName && (
-                                        <Badge variant="outline" className="flex items-center gap-1">
-                                          <User className="w-3 h-3" />
-                                          {dataPoint.annotatorName}
-                                        </Badge>
-                                      )}
+                                  {/* Section 0: Media Preview */}
+                                  {dataPoint.type === 'image' && (
+                                    <div className={
+                                      listLayout === 'grid'
+                                        ? "h-40 w-full overflow-hidden rounded-md border border-border/40 bg-muted/20"
+                                        : "h-24 w-24 flex-shrink-0 overflow-hidden rounded-md border border-border/40 bg-muted/20"
+                                    }>
+                                      <img
+                                        src={dataPoint.content}
+                                        alt="Thumbnail"
+                                        className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+                                        onError={(e) => {
+                                          (e.target as HTMLImageElement).src = 'https://placehold.co/200x200?text=Error';
+                                        }}
+                                      />
                                     </div>
-                                  </div>
+                                  )}
+                                  {dataPoint.type === 'audio' && (
+                                    <div className={
+                                      listLayout === 'grid'
+                                        ? "w-full rounded-md border border-border/40 bg-muted/20 p-2"
+                                        : "w-full sm:w-52 flex-shrink-0 rounded-md border border-border/40 bg-muted/20 p-2"
+                                    }>
+                                      <audio controls src={getPlayableAudioSource(dataPoint.content) || ''} className="w-full">
+                                        {t("workspace.browserNoAudio")}
+                                      </audio>
+                                    </div>
+                                  )}
 
-
-                                  {/* Section 2: Main Content */}
-                                  <div className={`flex-1 min-w-0 space-y-1 max-w-full ${listLayout === 'grid' ? "w-full" : ""}`}>
-                                    <p className="text-sm font-medium text-foreground line-clamp-1 w-full">
-                                      {dataPoint.content || 'Untitled content'}
-                                    </p>
-                                    <p className="text-xs text-muted-foreground break-words whitespace-normal line-clamp-2">
-                                      {preview.text || 'No annotation yet.'}
-                                    </p>
-                                  </div>
-                                  {/* Section 3: Metadata */}
-                                  {
-                                    dataPoint.displayMetadata && Object.keys(dataPoint.displayMetadata).length > 0 && (
-                                      <div className={listLayout === 'list' ? "sm:w-[220px] flex-shrink-0" : "w-full mt-auto pt-2 border-t border-border/40"}>
-                                        <div className="flex flex-wrap gap-2 text-[11px] text-muted-foreground min-w-0">
-                                          {Object.entries(dataPoint.displayMetadata).slice(0, 6).map(([key, value]) => (
-                                            <div
-                                              key={key}
-                                              className="inline-flex max-w-[180px] min-w-0 items-center gap-1 rounded-full border border-border/60 bg-muted/40 px-2 py-0.5"
-                                            >
-                                              <span className="uppercase tracking-wide text-muted-foreground/80 truncate min-w-0">
-                                                {key}
-                                              </span>
-                                              <span className="truncate min-w-0">:{value}</span>
-                                            </div>
-                                          ))}
-                                        </div>
+                                  <div className="flex flex-1 flex-col justify-between min-w-0 h-full">
+                                    {/* Section 1: Badges & Status */}
+                                    <div className={listLayout === 'list' ? "flex flex-wrap items-center gap-2 mb-2" : "w-full"}>
+                                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                                        {(() => {
+                                          const displayStatus = getDisplayStatus(dataPoint);
+                                          return (
+                                            <Badge variant={getStatusVariant(displayStatus.code)}>
+                                              {displayStatus.label}
+                                            </Badge>
+                                          );
+                                        })()}
+                                        <Badge variant="outline">
+                                          #{index + 1}
+                                        </Badge>
+                                        {canViewIaaDetails && dataPoint.isIAA && (
+                                          <Badge variant="default">IAA</Badge>
+                                        )}
+                                        {preview.text !== '' && (
+                                          <Badge variant="secondary">{preview.label}</Badge>
+                                        )}
+                                        {!isAnnotatorForProject && (
+                                          (() => {
+                                            const names = getDoneAnnotatorNames(dataPoint);
+                                            if (names.length > 0) {
+                                              return (
+                                                <Badge variant="outline" className="flex items-center gap-1">
+                                                  <User className="w-3 h-3" />
+                                                  {names.join(', ')}
+                                                </Badge>
+                                              );
+                                            }
+                                            if (dataPoint.annotatorName) {
+                                              return (
+                                                <Badge variant="outline" className="flex items-center gap-1">
+                                                  <User className="w-3 h-3" />
+                                                  {dataPoint.annotatorName}
+                                                </Badge>
+                                              );
+                                            }
+                                            return null;
+                                          })()
+                                        )}
+                                        {isAnnotatorForProject && getDoneCount(dataPoint) > 0 && (
+                                          <Badge variant="outline" className="flex items-center gap-1">
+                                            <User className="w-3 h-3" />
+                                            {(getDoneAnnotatorNames(dataPoint).join(', ')) || t("workspace.annotatedFallback")}
+                                          </Badge>
+                                        )}
                                       </div>
-                                    )
-                                  }
+                                    </div>
+
+                                    {/* Section 2: Main Content */}
+                                    <div className={`flex-1 min-w-0 space-y-1 max-w-full ${listLayout === 'grid' ? "w-full mt-2" : ""}`}>
+                                      <p className="text-sm font-medium text-foreground line-clamp-1 w-full">
+                                        {dataPoint.type === 'image'
+                                          ? (dataPoint.metadata?.filename || dataPoint.metadata?.name || 'Image content')
+                                          : dataPoint.type === 'audio'
+                                            ? (dataPoint.metadata?.filename || dataPoint.metadata?.name || 'Audio content')
+                                            : (dataPoint.content || 'Untitled content')}
+                                      </p>
+                                      <p className="text-xs text-muted-foreground break-words whitespace-normal line-clamp-2">
+                                        {preview.text || t("workspace.noAnnotationYet")}
+                                      </p>
+                                    </div>
+
+                                    {/* Section 3: Metadata */}
+                                    {
+                                      dataPoint.displayMetadata && Object.keys(dataPoint.displayMetadata).length > 0 && (
+                                        <div className={listLayout === 'list' ? "mt-2" : "w-full mt-auto pt-2 border-t border-border/40"}>
+                                          <div className="flex flex-wrap gap-2 text-[11px] text-muted-foreground min-w-0">
+                                            {Object.entries(dataPoint.displayMetadata).slice(0, 3).map(([key, value]) => (
+                                              <div
+                                                key={key}
+                                                className="inline-flex max-w-[150px] min-w-0 items-center gap-1 rounded-full border border-border/60 bg-muted/40 px-2 py-0.5"
+                                              >
+                                                <span className="uppercase tracking-wide text-muted-foreground/80 truncate min-w-0">
+                                                  {key}
+                                                </span>
+                                                <span className="truncate min-w-0">:{value}</span>
+                                              </div>
+                                            ))}
+                                          </div>
+                                        </div>
+                                      )
+                                    }
+                                  </div>
                                 </div>
                               );
                             })
@@ -3084,7 +4489,7 @@ const DataLabelingWorkspace = () => {
 
                         <div className="flex flex-col gap-3 border-t border-border pt-4 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
                           <span>
-                            Showing {annotationStartIndex}-{annotationEndIndex} of {filteredAnnotationEntries.length}
+                            {t("workspace.showing", { start: annotationStartIndex, end: annotationEndIndex, total: filteredAnnotationEntries.length })}
                           </span>
                           <div className="flex items-center gap-2">
                             <Button
@@ -3093,10 +4498,10 @@ const DataLabelingWorkspace = () => {
                               onClick={() => setAnnotationPage(prev => Math.max(1, prev - 1))}
                               disabled={safeAnnotationPage === 1}
                             >
-                              <ChevronLeft className="w-4 h-4" />
+                              {isRTL ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4" />}
                             </Button>
                             <span className="text-xs font-medium text-foreground">
-                              Page {safeAnnotationPage} of {totalAnnotationPages}
+                              {t("workspace.pageOf", { page: safeAnnotationPage, total: totalAnnotationPages })}
                             </span>
                             <Button
                               size="sm"
@@ -3104,7 +4509,7 @@ const DataLabelingWorkspace = () => {
                               onClick={() => setAnnotationPage(prev => Math.min(totalAnnotationPages, prev + 1))}
                               disabled={safeAnnotationPage === totalAnnotationPages}
                             >
-                              <ChevronRight className="w-4 h-4" />
+                              {isRTL ? <ChevronLeft className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
                             </Button>
                           </div>
                         </div>
@@ -3115,11 +4520,17 @@ const DataLabelingWorkspace = () => {
               </div>
 
               {viewMode === 'record' ? (
-                <div className="w-80 flex-shrink-0">
+                <div id="tutorial-annotation-form" className={`flex-shrink-0 transition-all duration-300 ${showRightSidebar ? 'w-80' : 'w-10'}`}>
+                  {showRightSidebar ? (
                   <Card className="p-6 space-y-6 sticky top-6">
-                    <div className="flex items-center gap-2">
-                      <Sparkles className="w-5 h-5 text-purple-500" />
-                      <h3 className="font-semibold">Actions</h3>
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Sparkles className="w-5 h-5 text-purple-500" />
+                        <h3 className="font-semibold">{t("workspace.actionsPanel")}</h3>
+                      </div>
+                      <Button size="icon" variant="ghost" className="h-6 w-6 shrink-0" onClick={() => setShowRightSidebar(false)} title="Collapse sidebar">
+                        {isRTL ? <ChevronLeft className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                      </Button>
                     </div>
 
                     {/* AI Processing */}
@@ -3133,12 +4544,12 @@ const DataLabelingWorkspace = () => {
                         {isProcessing ? (
                           <>
                             <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                            Processing...
+                            {t("workspace.processing")}
                           </>
                         ) : (
                           <>
                             <Brain className="w-4 h-4 mr-2" />
-                            Process Current
+                            {t("workspace.processCurrent")}
                           </>
                         )}
                       </Button>
@@ -3149,12 +4560,12 @@ const DataLabelingWorkspace = () => {
                             className="w-full h-2"
                           />
                           <p className="text-xs text-muted-foreground">
-                            Processing in batches...
+                            {t("workspace.processingBatches")}
                           </p>
                         </div>
                       ) : (
                         <p className="text-xs text-muted-foreground">
-                          Run selected models on all pending items
+                          {t("workspace.runPendingItems")}
                         </p>
                       )}
                     </div>
@@ -3163,16 +4574,16 @@ const DataLabelingWorkspace = () => {
 
                     {/* Annotation Actions */}
                     <div className="space-y-2">
-                      <Label className="text-sm font-medium">Manual Actions</Label>
+                      <Label className="text-sm font-medium">{t("workspace.manualActions")}</Label>
                       <Button
                         size="sm"
                         variant="destructive"
                         className="w-full"
-                        onClick={handleRejectAnnotation}
-                        disabled={!currentDataPoint?.finalAnnotation && Object.keys(currentDataPoint?.aiSuggestions || {}).length === 0}
+                        onClick={() => handleRejectAnnotation(annotatorMeta)}
+                        disabled={!currentAssignment}
                       >
                         <X className="w-4 h-4 mr-2" />
-                        Clear / Reject
+                        {t("workspace.clearReject")}
                       </Button>
                     </div>
 
@@ -3182,18 +4593,18 @@ const DataLabelingWorkspace = () => {
                     <div className="space-y-4">
                       <div className="flex items-center gap-2">
                         <BarChart3 className="w-4 h-4 text-blue-500" />
-                        <Label className="text-sm font-medium">Session Statistics</Label>
+                        <Label className="text-sm font-medium">{t("workspace.sessionStatistics")}</Label>
                       </div>
 
                       {/* Progress Overview */}
                       <div className="grid grid-cols-2 gap-3">
                         <div className="text-center p-3 bg-green-50 dark:bg-green-950/20 rounded-lg border border-green-200 dark:border-green-800">
-                          <div className="text-lg font-bold text-green-600">{completedCount}</div>
-                          <div className="text-xs text-muted-foreground">Completed</div>
+                          <div className="text-lg font-bold text-green-600">{globalCompletedCount}</div>
+                          <div className="text-xs text-muted-foreground">{t("workspace.completed_stat")}</div>
                         </div>
                         <div className="text-center p-3 bg-blue-50 dark:bg-blue-950/20 rounded-lg border border-blue-200 dark:border-blue-800">
-                          <div className="text-lg font-bold text-blue-600">{dataPoints.length - completedCount}</div>
-                          <div className="text-xs text-muted-foreground">Remaining</div>
+                          <div className="text-lg font-bold text-blue-600">{globalRemainingCount}</div>
+                          <div className="text-xs text-muted-foreground">{t("workspace.remaining")}</div>
                         </div>
                       </div>
 
@@ -3202,7 +4613,7 @@ const DataLabelingWorkspace = () => {
                         <div className="flex items-center justify-between p-2 bg-muted/30 rounded">
                           <div className="flex items-center gap-2 text-xs">
                             <CheckCircle className="w-3 h-3 text-green-600" />
-                            <span>Accepted</span>
+                            <span>{t("workspace.accepted")}</span>
                           </div>
                           <span className="text-xs font-medium">{annotationStats.totalAccepted}</span>
                         </div>
@@ -3210,7 +4621,7 @@ const DataLabelingWorkspace = () => {
                         <div className="flex items-center justify-between p-2 bg-muted/30 rounded">
                           <div className="flex items-center gap-2 text-xs">
                             <Edit className="w-3 h-3 text-orange-600" />
-                            <span>Edited</span>
+                            <span>{t("workspace.edited")}</span>
                           </div>
                           <span className="text-xs font-medium">{annotationStats.totalEdited}</span>
                         </div>
@@ -3218,7 +4629,7 @@ const DataLabelingWorkspace = () => {
                         <div className="flex items-center justify-between p-2 bg-muted/30 rounded">
                           <div className="flex items-center gap-2 text-xs">
                             <Zap className="w-3 h-3 text-purple-600" />
-                            <span>AI Processed</span>
+                            <span>{t("workspace.aiProcessed")}</span>
                           </div>
                           <span className="text-xs font-medium">{annotationStats.totalProcessed}</span>
                         </div>
@@ -3229,7 +4640,7 @@ const DataLabelingWorkspace = () => {
                         <div className="flex items-center justify-between p-2 bg-blue-50 dark:bg-blue-950/20 rounded border border-blue-200 dark:border-blue-800">
                           <div className="flex items-center gap-2 text-xs">
                             <Clock className="w-3 h-3 text-blue-600" />
-                            <span>Session Time</span>
+                            <span>{t("workspace.sessionTime")}</span>
                           </div>
                           <span className="text-xs font-medium">{formatTime(annotationStats.sessionTime)}</span>
                         </div>
@@ -3237,7 +4648,7 @@ const DataLabelingWorkspace = () => {
                         <div className="flex items-center justify-between p-2 bg-green-50 dark:bg-green-950/20 rounded border border-green-200 dark:border-green-800">
                           <div className="flex items-center gap-2 text-xs">
                             <TrendingUp className="w-3 h-3 text-green-600" />
-                            <span>Rate (per hour)</span>
+                            <span>{t("workspace.ratePerHour")}</span>
                           </div>
                           <span className="text-xs font-medium">{getAnnotationRate()}</span>
                         </div>
@@ -3247,7 +4658,7 @@ const DataLabelingWorkspace = () => {
                       {dataPoints.length > 0 && (
                         <div className="space-y-2">
                           <div className="flex justify-between text-xs">
-                            <span>Overall Progress</span>
+                            <span>{t("workspace.overallProgress")}</span>
                             <span>{Math.round(progress)}%</span>
                           </div>
                           <Progress value={progress} className="h-2" />
@@ -3255,41 +4666,55 @@ const DataLabelingWorkspace = () => {
                       )}
                     </div>
                   </Card>
+                  ) : (
+                    <div className="sticky top-6 flex flex-col items-center gap-2 pt-2">
+                      <Button size="icon" variant="ghost" className="h-8 w-8" onClick={() => setShowRightSidebar(true)} title="Expand sidebar">
+                        {isRTL ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4" />}
+                      </Button>
+                      <Sparkles className="w-4 h-4 text-purple-400 opacity-60" />
+                    </div>
+                  )}
                 </div>
               ) : (
-                <div className="w-80 flex-shrink-0">
+                <div className={`flex-shrink-0 transition-all duration-300 ${showRightSidebar ? 'w-80' : 'w-10'}`}>
+                  {showRightSidebar ? (
                   <Card className="p-6 space-y-6 sticky top-6">
-                    <div className="flex items-center gap-2">
-                      <BarChart3 className="w-4 h-4 text-blue-500" />
-                      <Label className="text-sm font-medium">List Overview</Label>
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <BarChart3 className="w-4 h-4 text-blue-500" />
+                        <Label className="text-sm font-medium">{t("workspace.listOverview")}</Label>
+                      </div>
+                      <Button size="icon" variant="ghost" className="h-6 w-6 shrink-0" onClick={() => setShowRightSidebar(false)} title="Collapse sidebar">
+                        {isRTL ? <ChevronLeft className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                      </Button>
                     </div>
 
                     <div className="grid grid-cols-2 gap-3">
                       <div className="text-center p-3 bg-green-50 dark:bg-green-950/20 rounded-lg border border-green-200 dark:border-green-800">
-                        <div className="text-lg font-bold text-green-600">{completedCount}</div>
-                        <div className="text-xs text-muted-foreground">Completed</div>
+                        <div className="text-lg font-bold text-green-600">{globalCompletedCount}</div>
+                        <div className="text-xs text-muted-foreground">{t("workspace.completed_stat")}</div>
                       </div>
                       <div className="text-center p-3 bg-blue-50 dark:bg-blue-950/20 rounded-lg border border-blue-200 dark:border-blue-800">
-                        <div className="text-lg font-bold text-blue-600">{dataPoints.length - completedCount}</div>
-                        <div className="text-xs text-muted-foreground">Remaining</div>
+                        <div className="text-lg font-bold text-blue-600">{globalRemainingCount}</div>
+                        <div className="text-xs text-muted-foreground">{t("workspace.remaining")}</div>
                       </div>
                     </div>
 
                     <div className="space-y-2">
                       <div className="flex items-center justify-between p-2 bg-muted/30 rounded text-xs">
-                        <span>Filtered items</span>
-                        <span className="font-medium">{filteredAnnotationEntries.length}</span>
+                        <span>{t("workspace.filteredItems")}</span>
+                        <span className="font-medium">{globalFilteredCount}</span>
                       </div>
                       <div className="flex items-center justify-between p-2 bg-muted/30 rounded text-xs">
-                        <span>Total items</span>
-                        <span className="font-medium">{dataPoints.length}</span>
+                        <span>{t("workspace.totalItems")}</span>
+                        <span className="font-medium">{globalTotalItems}</span>
                       </div>
                     </div>
 
                     <Separator />
 
                     <div className="space-y-2">
-                      <Label className="text-sm font-medium">Batch Actions</Label>
+                      <Label className="text-sm font-medium">{t("workspace.batchActions")}</Label>
                       <Button
                         variant="outline"
                         className="w-full"
@@ -3297,7 +4722,7 @@ const DataLabelingWorkspace = () => {
                         disabled={dataPoints.length === 0 || pendingIndices.length === 0}
                       >
                         <Shuffle className="w-4 h-4 mr-2" />
-                        Random Pending
+                        {t("workspace.randomPending")}
                       </Button>
                       <Button
                         variant="outline"
@@ -3306,7 +4731,7 @@ const DataLabelingWorkspace = () => {
                         disabled={filteredNavigationIndices.length === 0}
                       >
                         <Play className="w-4 h-4 mr-2" />
-                        Start Filtered Scope
+                        {t("workspace.startFilteredScope")}
                       </Button>
                       <Button
                         className="w-full"
@@ -3318,13 +4743,13 @@ const DataLabelingWorkspace = () => {
                           <>
                             <Loader2 className="w-4 h-4 mr-2 animate-spin" />
                             {processingProgress.total > 0
-                              ? `Processing... (${processingProgress.current}/${processingProgress.total})`
-                              : 'Processing...'}
+                              ? t("workspace.processingCount", { current: processingProgress.current, total: processingProgress.total })
+                              : t("workspace.processing")}
                           </>
                         ) : (
                           <>
                             <Brain className="w-4 h-4 mr-2" />
-                            Process All with AI
+                            {t("workspace.processAllWithAI")}
                           </>
                         )}
                       </Button>
@@ -3338,12 +4763,12 @@ const DataLabelingWorkspace = () => {
                         {isProcessing ? (
                           <>
                             <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                            Processing...
+                            {t("workspace.processing")}
                           </>
                         ) : (
                           <>
                             <Brain className="w-4 h-4 mr-2" />
-                            Process Filtered with AI
+                            {t("workspace.processFilteredWithAI")}
                           </>
                         )}
                       </Button>
@@ -3355,10 +4780,18 @@ const DataLabelingWorkspace = () => {
                         title={!canExport ? "Requires manager or admin role" : undefined}
                       >
                         <Download className="w-4 h-4 mr-2" />
-                        Export Results
+                        {t("workspace.exportResults")}
                       </Button>
                     </div>
                   </Card>
+                  ) : (
+                    <div className="sticky top-6 flex flex-col items-center gap-2 pt-2">
+                      <Button size="icon" variant="ghost" className="h-8 w-8" onClick={() => setShowRightSidebar(true)} title="Expand sidebar">
+                        {isRTL ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4" />}
+                      </Button>
+                      <BarChart3 className="w-4 h-4 text-blue-400 opacity-60" />
+                    </div>
+                  )}
                 </div>
               )}
             </div>

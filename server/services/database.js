@@ -2,12 +2,14 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import bcrypt from 'bcryptjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Database file location
-const DATA_DIR = process.env.DATA_DIR || path.resolve(__dirname, '..', 'data');
+// Database file location — defaults to ./data/ relative to where the process is started,
+// so global npm installs store data in the user's working directory, not inside node_modules.
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const DB_PATH = path.join(DATA_DIR, 'databayt.sqlite');
 
 let db = null;
@@ -164,6 +166,26 @@ function createSchema() {
     )
   `);
 
+  // Data point comments table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS data_point_comments (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      data_point_id TEXT NOT NULL,
+      author_id TEXT NOT NULL,
+      author_name TEXT NOT NULL,
+      body TEXT NOT NULL,
+      parent_comment_id TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      deleted_at INTEGER,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY (data_point_id) REFERENCES data_points(id) ON DELETE CASCADE,
+      FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (parent_comment_id) REFERENCES data_point_comments(id) ON DELETE SET NULL
+    )
+  `);
+
   // Provider connections table
   db.exec(`
     CREATE TABLE IF NOT EXISTS provider_connections (
@@ -224,25 +246,74 @@ function createSchema() {
     )
   `);
 
+  // Notifications table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS notifications (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      data TEXT DEFAULT '{}',
+      is_read INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+
   // Create indexes for common queries
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_data_points_project ON data_points(project_id);
     CREATE INDEX IF NOT EXISTS idx_data_points_status ON data_points(status);
+    CREATE INDEX IF NOT EXISTS idx_comments_project_data_point ON data_point_comments(project_id, data_point_id);
+    CREATE INDEX IF NOT EXISTS idx_comments_created_at ON data_point_comments(created_at);
     CREATE INDEX IF NOT EXISTS idx_snapshots_project ON snapshots(project_id);
     CREATE INDEX IF NOT EXISTS idx_audit_log_project ON audit_log(project_id);
     CREATE INDEX IF NOT EXISTS idx_project_annotators_user ON project_annotators(user_id);
     CREATE INDEX IF NOT EXISTS idx_invite_tokens_token ON invite_tokens(token);
+    CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, created_at);
   `);
+
+  // Migrations — add columns if they don't exist yet
+  const migrations = [
+    `ALTER TABLE projects ADD COLUMN task_type TEXT DEFAULT 'custom'`,
+    `ALTER TABLE data_points ADD COLUMN is_iaa INTEGER DEFAULT 0`,
+    `ALTER TABLE data_points ADD COLUMN assignments TEXT DEFAULT '[]'`,
+    `ALTER TABLE projects ADD COLUMN iaa_config TEXT`,
+    `ALTER TABLE projects ADD COLUMN guidelines TEXT`,
+    `ALTER TABLE projects ADD COLUMN is_demo INTEGER DEFAULT 0`,
+    // Task templates
+    `CREATE TABLE IF NOT EXISTS task_templates (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT,
+      category TEXT NOT NULL DEFAULT 'Custom',
+      xml_config TEXT NOT NULL,
+      is_global INTEGER DEFAULT 0,
+      created_by TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_task_templates_global ON task_templates(is_global)`,
+    // QA queue columns
+    `ALTER TABLE data_points ADD COLUMN qa_status TEXT DEFAULT 'pending_review'`,
+    `ALTER TABLE data_points ADD COLUMN qa_reviewer_id TEXT`,
+    `ALTER TABLE projects ADD COLUMN ai_instruction TEXT`,
+  ];
+  for (const sql of migrations) {
+    try { db.exec(sql); } catch (_) { /* already exists */ }
+  }
 
   // Seed default admin user if no users exist
   const userCount = db.prepare('SELECT COUNT(*) as count FROM users').get();
   if (userCount.count === 0) {
     const now = Date.now();
+    const defaultHash = bcrypt.hashSync('admin', 12);
     db.prepare(`
       INSERT INTO users (id, username, password, roles, must_change_password, created_at, updated_at)
-      VALUES (?, 'admin', 'admin', '["admin","manager","annotator"]', 0, ?, ?)
-    `).run(crypto.randomUUID(), now, now);
-    console.log('Created default admin user (username: admin, password: admin)');
+      VALUES (?, 'admin', ?, '["admin","manager","annotator"]', 1, ?, ?)
+    `).run(crypto.randomUUID(), defaultHash, now, now);
+    console.log('Created default admin user (username: admin, password: admin) — change this password immediately!');
   }
 }
 

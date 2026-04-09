@@ -1,16 +1,27 @@
 // SDK imports removed to prevent client-side key exposure
-import { ModelProvider } from '@/types/data';
+import { ModelProvider, type AnnotationSchema } from '@/types/data';
+import { toAnthropicTool, toJsonSchema, toGeminiSchema } from './annotationSchema';
+
+const buildFetchHeaders = (jwtToken?: string): Record<string, string> => ({
+  'Content-Type': 'application/json',
+  ...(jwtToken ? { Authorization: `Bearer ${jwtToken}` } : {})
+});
 
 export interface AIRequestOptions {
   temperature?: number;
   maxTokens?: number;
+  jwtToken?: string;
+  annotationSchema?: AnnotationSchema;
 }
+
+export type AIInputType = 'text' | 'image' | 'audio';
 
 export interface AIProvider {
   id: string;
   name: string;
-  processText: (text: string, prompt?: string, apiKey?: string, modelId?: string, baseUrl?: string, type?: 'text' | 'image', options?: AIRequestOptions) => Promise<string>;
-  processBatch?: (texts: string[], prompt?: string, apiKey?: string, modelId?: string, baseUrl?: string, type?: 'text' | 'image', options?: AIRequestOptions) => Promise<string[]>;
+  // connectionId: the saved ProviderConnection.id — the server resolves the real API key from DB
+  processText: (text: string, prompt?: string, connectionId?: string, modelId?: string, baseUrl?: string, type?: AIInputType, options?: AIRequestOptions) => Promise<string>;
+  processBatch?: (texts: string[], prompt?: string, connectionId?: string, modelId?: string, baseUrl?: string, type?: AIInputType, options?: AIRequestOptions) => Promise<string[]>;
 }
 
 export const AVAILABLE_PROVIDERS: ModelProvider[] = [
@@ -34,6 +45,17 @@ export const AVAILABLE_PROVIDERS: ModelProvider[] = [
       { id: 'claude-3-5-sonnet-20240620', name: 'Claude 3.5 Sonnet', description: 'High intelligence' },
       { id: 'claude-3-opus-20240229', name: 'Claude 3 Opus', description: 'Most powerful' },
       { id: 'claude-3-haiku-20240307', name: 'Claude 3 Haiku', description: 'Fastest' }
+    ]
+  },
+  {
+    id: 'gemini',
+    name: 'Google Gemini',
+    description: 'Gemini models via Google AI Studio',
+    requiresApiKey: true,
+    models: [
+      { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', description: 'Fast multimodal model' },
+      { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro', description: 'High quality multimodal model' },
+      { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash', description: 'Cost-efficient multimodal model' }
     ]
   },
   {
@@ -80,16 +102,17 @@ export const AVAILABLE_PROVIDERS: ModelProvider[] = [
 
 // Helper to resolve image content (URL or Base64)
 const resolveImageContent = async (text: string): Promise<string> => {
-  // If it's a data URL or a full HTTP URL (and we assume it's public), return as is
-  // But for OpenAI/Anthropic, localhost URLs won't work.
-  // So if it starts with '/' (relative) or 'http://localhost', we fetch and convert to base64.
+  // If it's a data URL, return as is
   if (text.startsWith('data:')) return text;
 
+  // For OpenAI/Anthropic/OpenRouter, localhost URLs won't work if they are calling from their servers.
+  // We MUST convert to base64 if it's local or if we want to ensure the provider gets the data directly.
   const isLocal = text.startsWith('/') || text.includes('localhost') || text.includes('127.0.0.1');
 
-  if (isLocal) {
+  if (isLocal || text.startsWith('http')) {
     try {
       const response = await fetch(text);
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
       const blob = await response.blob();
       return new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
@@ -98,8 +121,9 @@ const resolveImageContent = async (text: string): Promise<string> => {
         reader.readAsDataURL(blob);
       });
     } catch (e) {
-      console.error("Failed to convert local image to base64:", e);
-      throw new Error(`Failed to load local image: ${text}`);
+      console.error("Failed to resolve image content:", e);
+      if (text.startsWith('http')) return text; // Fallback to URL if fetch fails but it looks like a URL
+      throw new Error(`Failed to load image: ${text}`);
     }
   }
 
@@ -110,8 +134,8 @@ class OpenAIProvider implements AIProvider {
   id = 'openai';
   name = 'OpenAI GPT';
 
-  async processText(text: string, prompt?: string, apiKey?: string, modelId: string = 'gpt-4o-mini', baseUrl?: string, type: 'text' | 'image' = 'text', options?: AIRequestOptions): Promise<string> {
-    if (!apiKey) throw new Error('OpenAI API key is required');
+  async processText(text: string, prompt?: string, connectionId?: string, modelId: string = 'gpt-4o-mini', baseUrl?: string, type: AIInputType = 'text', options?: AIRequestOptions): Promise<string> {
+    if (!connectionId) throw new Error('OpenAI connection is required');
 
     const messages: any[] = [
       { role: "system", content: prompt || "You are a helpful data labeling assistant." }
@@ -122,26 +146,36 @@ class OpenAIProvider implements AIProvider {
       messages.push({
         role: "user",
         content: [
-          { type: "text", text: "Analyze this image." },
-          { type: "image_url", image_url: { url: imageUrl } }
+          { type: "image_url", image_url: { url: imageUrl } },
+          { type: "text", text: "Please analyze the image provided according to the system instructions." }
         ]
       });
     } else {
       messages.push({ role: "user", content: text });
     }
 
-    const response = await fetch('/api/openai/chat', {
+    const openaiBody: Record<string, unknown> = {
+      model: modelId,
+      messages,
+      temperature: options?.temperature,
+      max_tokens: options?.maxTokens
+    };
+
+    if (options?.annotationSchema) {
+      openaiBody.response_format = {
+        type: 'json_schema',
+        json_schema: {
+          name: 'annotation',
+          strict: true,
+          schema: toJsonSchema(options.annotationSchema)
+        }
+      };
+    }
+
+    const response = await fetch(`/api/openai/chat?connectionId=${encodeURIComponent(connectionId)}`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: modelId,
-        messages,
-        temperature: options?.temperature,
-        max_tokens: options?.maxTokens
-      })
+      headers: buildFetchHeaders(options?.jwtToken),
+      body: JSON.stringify(openaiBody)
     });
 
     if (!response.ok) {
@@ -153,8 +187,8 @@ class OpenAIProvider implements AIProvider {
     return data.choices[0].message.content || '';
   }
 
-  async processBatch(texts: string[], prompt?: string, apiKey?: string, modelId: string = 'gpt-4o-mini', baseUrl?: string, type: 'text' | 'image' = 'text', options?: AIRequestOptions): Promise<string[]> {
-    const promises = texts.map(text => this.processText(text, prompt, apiKey, modelId, baseUrl, type, options));
+  async processBatch(texts: string[], prompt?: string, connectionId?: string, modelId: string = 'gpt-4o-mini', baseUrl?: string, type: AIInputType = 'text', options?: AIRequestOptions): Promise<string[]> {
+    const promises = texts.map(text => this.processText(text, prompt, connectionId, modelId, baseUrl, type, options));
     return Promise.all(promises);
   }
 }
@@ -163,8 +197,8 @@ class AnthropicProvider implements AIProvider {
   id = 'anthropic';
   name = 'Anthropic Claude';
 
-  async processText(text: string, prompt?: string, apiKey?: string, modelId: string = 'claude-3-5-sonnet-20240620', baseUrl?: string, type: 'text' | 'image' = 'text', options?: AIRequestOptions): Promise<string> {
-    if (!apiKey) throw new Error('Anthropic API key is required');
+  async processText(text: string, prompt?: string, connectionId?: string, modelId: string = 'claude-3-5-sonnet-20240620', baseUrl?: string, type: AIInputType = 'text', options?: AIRequestOptions): Promise<string> {
+    if (!connectionId) throw new Error('Anthropic connection is required');
 
     const messages: any[] = [];
 
@@ -180,7 +214,7 @@ class AnthropicProvider implements AIProvider {
             role: "user",
             content: [
               { type: "image", source: { type: "base64", media_type: mediaType, data: data } },
-              { type: "text", text: "Analyze this image." }
+              { type: "text", text: "Please analyze the image provided." }
             ]
           });
         } else {
@@ -207,7 +241,7 @@ class AnthropicProvider implements AIProvider {
               role: "user",
               content: [
                 { type: "image", source: { type: "base64", media_type: matches[1], data: matches[2] } },
-                { type: "text", text: "Analyze this image." }
+                { type: "text", text: "Please analyze the image provided." }
               ]
             });
           }
@@ -219,19 +253,23 @@ class AnthropicProvider implements AIProvider {
       messages.push({ role: "user", content: text });
     }
 
-    const response = await fetch('/api/anthropic/message', {
+    const anthropicBody: Record<string, unknown> = {
+      model: modelId,
+      max_tokens: options?.maxTokens ?? 1024,
+      temperature: options?.temperature,
+      system: prompt || "You are a helpful data labeling assistant.",
+      messages
+    };
+
+    if (options?.annotationSchema) {
+      anthropicBody.tools = [toAnthropicTool(options.annotationSchema)];
+      anthropicBody.tool_choice = { type: 'tool', name: 'submit_annotation' };
+    }
+
+    const response = await fetch(`/api/anthropic/message?connectionId=${encodeURIComponent(connectionId)}`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: modelId,
-        max_tokens: options?.maxTokens ?? 1024,
-        temperature: options?.temperature,
-        system: prompt || "You are a helpful data labeling assistant.",
-        messages
-      })
+      headers: buildFetchHeaders(options?.jwtToken),
+      body: JSON.stringify(anthropicBody)
     });
 
     if (!response.ok) {
@@ -240,7 +278,91 @@ class AnthropicProvider implements AIProvider {
     }
 
     const data = await response.json();
+
+    // When tool_use is forced, content[0] is { type: "tool_use", input: {...} }
+    if (options?.annotationSchema && data.content?.[0]?.type === 'tool_use') {
+      return JSON.stringify(data.content[0].input);
+    }
     return data.content[0].text || '';
+  }
+}
+
+class GeminiProvider implements AIProvider {
+  id = 'gemini';
+  name = 'Google Gemini';
+
+  async processText(text: string, prompt?: string, connectionId?: string, modelId: string = 'gemini-2.0-flash', baseUrl?: string, type: AIInputType = 'text', options?: AIRequestOptions): Promise<string> {
+    if (!connectionId) throw new Error('Gemini connection is required');
+
+    const parts: Array<Record<string, unknown>> = [];
+    const userText = type === 'image'
+      ? 'Please analyze the image provided according to the system instructions.'
+      : text;
+
+    parts.push({ text: userText });
+
+    if (type === 'image') {
+      const imageUrl = await resolveImageContent(text);
+      const matches = imageUrl.match(/^data:(.+);base64,(.+)$/);
+      if (!matches || matches.length !== 3) {
+        throw new Error('Gemini requires image data as a base64 data URL.');
+      }
+      parts.push({
+        inline_data: {
+          mime_type: matches[1],
+          data: matches[2]
+        }
+      });
+    }
+
+    const generationConfig: Record<string, unknown> = {
+      temperature: options?.temperature,
+      maxOutputTokens: options?.maxTokens
+    };
+
+    if (options?.annotationSchema) {
+      generationConfig.response_mime_type = 'application/json';
+      generationConfig.response_schema = toGeminiSchema(options.annotationSchema);
+    }
+
+    const body: Record<string, unknown> = {
+      model: modelId,
+      contents: [
+        {
+          role: 'user',
+          parts
+        }
+      ],
+      generationConfig
+    };
+
+    if (prompt) {
+      body.systemInstruction = {
+        parts: [{ text: prompt }]
+      };
+    }
+
+    const response = await fetch(`/api/gemini/generate?connectionId=${encodeURIComponent(connectionId)}`, {
+      method: 'POST',
+      headers: buildFetchHeaders(options?.jwtToken),
+      body: JSON.stringify(body)
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(
+        data?.error?.message
+        || data?.error
+        || 'Gemini API Error'
+      );
+    }
+
+    const candidate = data?.candidates?.[0];
+    const contentParts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+    const textParts = contentParts
+      .map((part: { text?: string }) => part?.text || '')
+      .filter(Boolean);
+    return textParts.join('\n').trim();
   }
 }
 
@@ -248,29 +370,67 @@ class SambaNovaProvider implements AIProvider {
   id = 'sambanova';
   name = 'SambaNova Cloud';
 
-  async processText(text: string, prompt?: string, apiKey?: string, modelId: string = 'Meta-Llama-3.1-70B-Instruct', baseUrl?: string, type: 'text' | 'image' = 'text', options?: AIRequestOptions): Promise<string> {
-    if (!apiKey) throw new Error('SambaNova API key is required');
+  async processText(text: string, prompt?: string, connectionId?: string, modelId: string = 'Meta-Llama-3.1-70B-Instruct', baseUrl?: string, type: AIInputType = 'text', options?: AIRequestOptions): Promise<string> {
+    if (!connectionId) throw new Error('SambaNova connection is required');
 
     if (type === 'image') {
-      throw new Error("SambaNova does not currently support image input in this integration.");
-    }
+      const imageUrl = await resolveImageContent(text);
+      const messages: any[] = [
+        { role: "system", content: prompt || "You are a helpful data labeling assistant." }
+      ];
 
-    const response = await fetch('/api/sambanova/chat', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
+      // Assuming SambaNova follows OpenAI format for vision if supported
+      messages.push({
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: imageUrl } },
+          { type: "text", text: "Please analyze the image provided." }
+        ]
+      });
+
+      const sambaVisionBody: Record<string, unknown> = {
         model: modelId,
-        messages: [
-          { role: "system", content: prompt || "You are a helpful data labeling assistant." },
-          { role: "user", content: text }
-        ],
+        messages,
         temperature: options?.temperature ?? 0.1,
         top_p: 0.1,
         max_tokens: options?.maxTokens
-      })
+      };
+      if (options?.annotationSchema) sambaVisionBody.response_format = { type: 'json_object' };
+
+      const response = await fetch(`/api/sambanova/chat?connectionId=${encodeURIComponent(connectionId)}`, {
+        method: 'POST',
+        headers: buildFetchHeaders(options?.jwtToken),
+        body: JSON.stringify(sambaVisionBody)
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error?.message || 'SambaNova Vision API Error');
+      }
+
+      const data = await response.json();
+      return data.choices[0].message.content || '';
+    }
+
+    const sambaBody: Record<string, unknown> = {
+      model: modelId,
+      messages: [
+        { role: "system", content: prompt || "You are a helpful data labeling assistant." },
+        { role: "user", content: text }
+      ],
+      temperature: options?.temperature ?? 0.1,
+      top_p: 0.1,
+      max_tokens: options?.maxTokens
+    };
+
+    if (options?.annotationSchema) {
+      sambaBody.response_format = { type: 'json_object' };
+    }
+
+    const response = await fetch(`/api/sambanova/chat?connectionId=${encodeURIComponent(connectionId)}`, {
+      method: 'POST',
+      headers: buildFetchHeaders(options?.jwtToken),
+      body: JSON.stringify(sambaBody)
     });
 
     if (!response.ok) {
@@ -287,28 +447,41 @@ class OpenRouterProvider implements AIProvider {
   id = 'openrouter';
   name = 'OpenRouter';
 
-  async processText(text: string, prompt?: string, apiKey?: string, modelId: string = 'openai/gpt-4o-mini', baseUrl?: string, type: 'text' | 'image' = 'text', options?: AIRequestOptions): Promise<string> {
-    if (!apiKey) throw new Error('OpenRouter API key is required');
+  async processText(text: string, prompt?: string, connectionId?: string, modelId: string = 'openai/gpt-4o-mini', baseUrl?: string, type: AIInputType = 'text', options?: AIRequestOptions): Promise<string> {
+    if (!connectionId) throw new Error('OpenRouter connection is required');
+
+    const messages: any[] = [
+      { role: "system", content: prompt || "You are a helpful data labeling assistant." }
+    ];
 
     if (type === 'image') {
-      throw new Error("OpenRouter image input is not enabled in this integration.");
+      const imageUrl = await resolveImageContent(text);
+      messages.push({
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: imageUrl } },
+          { type: "text", text: "Please analyze the image provided above." }
+        ]
+      });
+    } else {
+      messages.push({ role: "user", content: text });
     }
 
-    const response = await fetch('/api/openrouter/chat', {
+    const orBody: Record<string, unknown> = {
+      model: modelId,
+      messages,
+      temperature: options?.temperature,
+      max_tokens: options?.maxTokens
+    };
+
+    if (options?.annotationSchema) {
+      orBody.response_format = { type: 'json_object' };
+    }
+
+    const response = await fetch(`/api/openrouter/chat?connectionId=${encodeURIComponent(connectionId)}`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: modelId,
-        messages: [
-          { role: "system", content: prompt || "You are a helpful data labeling assistant." },
-          { role: "user", content: text }
-        ],
-        temperature: options?.temperature,
-        max_tokens: options?.maxTokens
-      })
+      headers: buildFetchHeaders(options?.jwtToken),
+      body: JSON.stringify(orBody)
     });
 
     if (!response.ok) {
@@ -325,7 +498,7 @@ class LocalProvider implements AIProvider {
   id = 'local';
   name = 'Local Model (Ollama)';
 
-  async processText(text: string, prompt?: string, apiKey?: string, modelId: string = 'llama3', baseUrl: string = 'http://localhost:11434', type: 'text' | 'image' = 'text', options?: AIRequestOptions): Promise<string> {
+  async processText(text: string, prompt?: string, apiKey?: string, modelId: string = 'llama3', baseUrl: string = 'http://localhost:11434', type: AIInputType = 'text', options?: AIRequestOptions): Promise<string> {
     const systemPrompt = prompt || "You are a helpful data labeling assistant.";
 
     // Ensure baseUrl doesn't end with slash
@@ -335,7 +508,8 @@ class LocalProvider implements AIProvider {
     const body: any = {
       model: modelId,
       stream: false,
-      options: {}
+      options: {},
+      ...(options?.annotationSchema ? { format: 'json' } : {})
     };
 
     if (type === 'image') {
@@ -387,6 +561,7 @@ class LocalProvider implements AIProvider {
 const providers: Record<string, AIProvider> = {
   openai: new OpenAIProvider(),
   anthropic: new AnthropicProvider(),
+  gemini: new GeminiProvider(),
   openrouter: new OpenRouterProvider(),
   sambanova: new SambaNovaProvider(),
   local: new LocalProvider()

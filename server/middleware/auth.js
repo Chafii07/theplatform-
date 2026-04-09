@@ -1,12 +1,33 @@
+import jwt from 'jsonwebtoken';
 import { getDatabase } from '../services/database.js';
 
-export const attachUser = (req, _res, next) => {
-  const userId = req.header('x-user-id');
+const JWT_SECRET = process.env.JWT_SECRET;
 
-  if (userId) {
+if (!JWT_SECRET) {
+  console.error('\n  FATAL: JWT_SECRET is not set in environment variables.');
+  console.error('  Set JWT_SECRET to a random string of at least 32 characters.\n');
+  process.exit(1);
+}
+
+const SECRET = JWT_SECRET;
+
+export const generateToken = (user) => {
+  return jwt.sign(
+    { id: user.id, username: user.username, roles: user.roles },
+    SECRET,
+    { expiresIn: '8h' }
+  );
+};
+
+export const attachUser = (req, _res, next) => {
+  const authHeader = req.headers.authorization;
+
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7);
     try {
+      const decoded = jwt.verify(token, SECRET);
       const db = getDatabase();
-      const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+      const user = db.prepare('SELECT * FROM users WHERE id = ?').get(decoded.id);
       if (user) {
         req.user = {
           ...user,
@@ -14,7 +35,7 @@ export const attachUser = (req, _res, next) => {
         };
       }
     } catch (error) {
-      console.error('Auth middleware error:', error);
+      // Invalid or expired token — req.user stays undefined
     }
   }
 

@@ -1,4 +1,4 @@
-import { Project, DataPoint, AnnotationStats, ProjectSnapshot, ProjectAuditEntry } from "@/types/data";
+import { Project, DataPoint, AnnotationStats, ProjectSnapshot, ProjectAuditEntry, ProjectIAAConfig, ProjectDataStatusCounts, DataPointComment } from "@/types/data";
 import { apiClient } from "./apiClient";
 
 export const projectService = {
@@ -10,10 +10,16 @@ export const projectService = {
     normalize: (project: Project): Project => {
         return {
             ...project,
+            guidelines: project.guidelines ?? '',
             managerId: project.managerId ?? null,
             annotatorIds: project.annotatorIds ?? [],
             auditLog: project.auditLog ?? [],
             dataPoints: project.dataPoints ?? [],
+            iaaConfig: project.iaaConfig ?? {
+                enabled: false,
+                portionPercent: 0,
+                annotatorsPerIAAItem: 2
+            },
             stats: project.stats ?? {
                 totalAccepted: 0,
                 totalRejected: 0,
@@ -45,19 +51,31 @@ export const projectService = {
         }
     },
 
-    getData: async (projectId: string, page: number = 1, limit: number = 50): Promise<{ dataPoints: DataPoint[]; pagination: any }> => {
+    getData: async (projectId: string, page: number = 1, limit?: number): Promise<{ dataPoints: DataPoint[]; pagination: any; statusCounts?: ProjectDataStatusCounts }> => {
         try {
             return await apiClient.projects.getData(projectId, page, limit);
         } catch (error) {
             console.error('Failed to fetch project data:', error);
-            return { dataPoints: [], pagination: {} };
+            return { dataPoints: [], pagination: {}, statusCounts: undefined };
         }
     },
 
-    create: async (name: string, description?: string, managerId?: string): Promise<Project> => {
-        const result = await apiClient.projects.create({ name, description, managerId });
+    create: async (name: string, description?: string, managerId?: string, iaaConfig?: ProjectIAAConfig, guidelines?: string, taskType?: import('@/types/data').TaskType): Promise<Project> => {
+        const result = await apiClient.projects.create({ name, description, managerId, iaaConfig, guidelines, taskType });
         return projectService.normalize({
             ...result,
+            name,
+            description,
+            guidelines,
+            managerId: managerId ?? null,
+            annotatorIds: [],
+            iaaConfig: iaaConfig ?? {
+                enabled: false,
+                portionPercent: 0,
+                annotatorsPerIAAItem: 2
+            },
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
             dataPoints: [],
             stats: {
                 totalAccepted: 0,
@@ -74,11 +92,14 @@ export const projectService = {
         await apiClient.projects.update(project.id, {
             name: project.name,
             description: project.description,
+            guidelines: project.guidelines,
             managerId: project.managerId,
             annotatorIds: project.annotatorIds,
+            taskType: project.taskType,
             xmlConfig: project.xmlConfig,
             uploadPrompt: project.uploadPrompt,
             customFieldName: project.customFieldName,
+            aiInstruction: project.aiInstruction,
             dataPoints: project.dataPoints,
             stats: project.stats,
         });
@@ -114,6 +135,26 @@ export const projectService = {
 
     updateDataPoint: async (projectId: string, dataId: string, updates: Partial<DataPoint>): Promise<void> => {
         await apiClient.projects.updateDataPoint(projectId, dataId, updates);
+    },
+
+    getComments: async (projectId: string, dataId: string, page: number = 1, limit: number = 20): Promise<{ comments: DataPointComment[]; pagination: { total: number; page: number; limit: number; totalPages: number } }> => {
+        const response = await apiClient.comments.getByDataPoint(projectId, dataId, page, limit);
+        return {
+            comments: response.comments as DataPointComment[],
+            pagination: response.pagination
+        };
+    },
+
+    createComment: async (projectId: string, dataId: string, body: string, parentCommentId?: string | null): Promise<DataPointComment> => {
+        return await apiClient.comments.create(projectId, dataId, { body, parentCommentId }) as DataPointComment;
+    },
+
+    updateComment: async (projectId: string, commentId: string, body: string): Promise<DataPointComment> => {
+        return await apiClient.comments.update(projectId, commentId, { body }) as DataPointComment;
+    },
+
+    deleteComment: async (projectId: string, commentId: string): Promise<void> => {
+        await apiClient.comments.delete(projectId, commentId);
     },
 
     // Snapshot methods

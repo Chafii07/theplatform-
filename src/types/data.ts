@@ -1,13 +1,13 @@
 export interface DataPoint {
     id: string;
     content: string;
-    type?: 'text' | 'image'; // Defaults to 'text' if undefined
+    type?: 'text' | 'image' | 'audio'; // Defaults to 'text' if undefined
     originalAnnotation?: string;
     humanAnnotation?: string;
     finalAnnotation?: string;
     aiSuggestions: Record<string, string>; // providerId -> suggestion
     ratings: Record<string, number>; // providerId -> rating (1-5)
-    status: 'pending' | 'ai_processed' | 'accepted' | 'edited' | 'rejected';
+    status: 'pending' | 'ai_processed' | 'accepted' | 'edited' | 'rejected' | 'partial' | 'needs_adjudication';
     confidence?: number;
     uploadPrompt?: string; // Prompt used during upload
     customField?: string; // Value of the custom field
@@ -19,6 +19,24 @@ export interface DataPoint {
     annotatorId?: string;
     annotatorName?: string;
     annotatedAt?: number;
+    isIAA?: boolean;
+    iaaRequiredCount?: number;
+    assignments?: AnnotationAssignment[];
+    annotationDrafts?: Record<string, string>;
+}
+
+export interface AnnotationAssignment {
+    annotatorId: string;
+    status: 'pending' | 'in_progress' | 'done';
+    value?: string;
+    annotatedAt?: number;
+}
+
+export interface ProjectIAAConfig {
+    enabled: boolean;
+    portionPercent: number;
+    annotatorsPerIAAItem: number;
+    seed?: number;
 }
 
 export interface ProjectSnapshot {
@@ -49,7 +67,8 @@ export interface ProviderConnection {
     id: string;
     providerId: ModelProvider['id'];
     name: string;
-    apiKey?: string;
+    apiKey?: string;       // masked on GET responses — never send as a header
+    hasApiKey?: boolean;   // true when a real key is stored server-side
     baseUrl?: string;
     isActive: boolean;
     createdAt: number;
@@ -87,16 +106,49 @@ export interface AnnotationStats {
     sessionTime: number;
 }
 
+export interface ProjectDataStatusCounts {
+    total: number;
+    completed: number;
+    remaining: number;
+    accepted: number;
+    edited: number;
+    pending: number;
+    aiProcessed: number;
+    rejected: number;
+}
+
+export type TaskType =
+    | 'text_classification'
+    | 'sequence_labeling'
+    | 'text_generation'
+    | 'image_classification'
+    | 'audio_transcription'
+    | 'custom';
+
+export const TASK_TYPE_LABELS: Record<TaskType, string> = {
+    text_classification: 'Text Classification',
+    sequence_labeling: 'Sequence Labeling (NER)',
+    text_generation: 'Text Generation / Translation',
+    image_classification: 'Image Classification',
+    audio_transcription: 'Audio Transcription',
+    custom: 'Custom Form',
+};
+
 export interface Project {
     id: string;
     name: string;
     description?: string;
+    guidelines?: string;
     managerId?: string | null;
     annotatorIds?: string[];
+    taskType?: TaskType;
     xmlConfig?: string;
     uploadPrompt?: string;
     customFieldName?: string;
+    aiInstruction?: string;
     auditLog?: ProjectAuditEntry[];
+    iaaConfig?: ProjectIAAConfig;
+    isDemo?: boolean;
     createdAt: number;
     updatedAt: number;
     dataPoints: DataPoint[];
@@ -111,4 +163,105 @@ export interface ProjectAuditEntry {
     actorName?: string;
     action: 'upload' | 'ai_process' | 'export' | 'assign';
     details?: string;
+}
+
+export interface DataPointComment {
+    id: string;
+    projectId: string;
+    dataPointId: string;
+    authorId: string;
+    authorName: string;
+    body: string;
+    parentCommentId?: string | null;
+    createdAt: number;
+    updatedAt: number;
+    deletedAt?: number | null;
+    isEdited: boolean;
+}
+
+export interface AnnotatorQualityStats {
+    annotatorId: string;
+    annotatorName: string;
+    totalAnnotated: number;
+    speedPerHour: number;
+    editRate: number;
+    rejectionRate: number;
+    agreementRate: number | null;
+    firstAnnotatedAt: number | null;
+    lastAnnotatedAt: number | null;
+}
+
+export interface IAAItemScore {
+    dataPointId: string;
+    contentPreview: string;
+    annotatorCount: number;
+    agreementScore: number;    // 0–1
+    annotations: Array<{ annotatorId: string; annotatorName: string; value: string }>;
+    isLowAgreement: boolean;
+}
+
+export interface IAAStats {
+    projectId: string;
+    threshold: number;
+    overallScore: number | null;
+    totalIAAItems: number;
+    itemsWithEnoughAnnotations: number;
+    lowAgreementCount: number;
+    items: IAAItemScore[];
+}
+
+
+// ── Annotation Schema (AI structured output) ──────────────────────────────
+
+export interface CustomField {
+    name: string;
+    type: 'string' | 'number' | 'boolean' | 'choice';
+    options?: string[];   // for choice type
+    required?: boolean;
+}
+
+export interface AnnotationSchema {
+    taskType: TaskType;
+    labels?: string[];       // for classification / sequence_labeling
+    fields?: CustomField[];  // for custom task type
+}
+
+export interface AnnotationSpan {
+    start: number;
+    end: number;
+    label: string;
+    text: string;
+}
+
+export interface AnnotationResult {
+    taskType: TaskType;
+    label?: string;
+    confidence?: number;
+    spans?: AnnotationSpan[];
+    text?: string;
+    fields?: Record<string, string | boolean | number>;
+    raw: string;
+}
+
+export interface TaskTemplate {
+    id: string;
+    name: string;
+    description?: string;
+    category: string;
+    xmlConfig: string;
+    isGlobal: boolean;
+    createdBy?: string;
+    createdAt: number;
+}
+
+export interface AnnotatorStatsResponse {
+    projectId: string;
+    annotators: AnnotatorQualityStats[];
+    summary: {
+        totalAnnotators: number;
+        avgSpeedPerHour: number;
+        avgEditRate: number;
+        avgRejectionRate: number;
+        avgAgreementRate: number | null;
+    };
 }

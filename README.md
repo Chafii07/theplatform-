@@ -1,249 +1,274 @@
 # DataBayt.AI Studio
 
-A powerful, modern data annotation tool that leverages AI to accelerate the data labeling process. Upload your data, choose an AI provider, and efficiently review and refine annotations.
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+[![Node.js >=18](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org)
+[![Built with React](https://img.shields.io/badge/frontend-React%2018-61DAFB?logo=react)](https://react.dev)
+[![Powered by SQLite](https://img.shields.io/badge/database-SQLite-003B57?logo=sqlite)](https://sqlite.org)
+[![i18n: AR/EN](https://img.shields.io/badge/i18n-Arabic%20%7C%20English-orange)](README.md)
 
-## 🚀 Features
+**Self-hosted · AI-assisted · Team-ready**
 
-- **Multi-format File Support**: Upload JSON, CSV, or TXT files containing your data
-- **AI-Powered Labeling**: Integration with OpenAI GPT, Anthropic Claude, and local models
-- **Custom Annotation Fields**: Create custom forms with XML configuration
-- **In-App XML Editor**: Customize your annotation interface directly in the app
-- **Custom Prompts**: Add optional custom instructions for the AI to follow
-- **Interactive Review**: Accept, edit, or completely change AI-generated annotations
-- **Progress Tracking**: Visual progress indicators and completion statistics
-- **Export Results**: Download your annotated data in JSON format (including custom fields)
-- **Keyboard Shortcuts**: Efficient navigation and workflow
-- **Modern UI**: Clean, responsive interface built with shadcn/ui
+A professional, fully self-hosted data annotation platform — built for teams who want **full ownership** of their labeling pipeline, AI-assisted workflows, and quality assurance tooling.
 
-## 🛠️ Setup
-
-### Prerequisites
-
-- **Node.js**: Ensure you have Node.js 18+ installed
-
-### Installation
-
-1. Install dependencies:
-   ```bash
-   npm install
-   ```
-
-2. Start the development server (runs both frontend and backend):
-   ```bash
-   npm run dev:all
-   ```
-
-3. Open your browser and navigate to the displayed local URL (usually `http://localhost:8080`)
-
-## 🔑 API Key Configuration
-
-### OpenAI API Key
-
-1. Click the Settings button (gear icon) in the top-right corner
-2. Select "OpenAI GPT" as your model provider
-3. Enter your OpenAI API key in the provided field
-4. Your API key is stored locally in your browser and never sent to our servers
-
-### Getting an OpenAI API Key
-
-1. Visit [OpenAI's website](https://platform.openai.com/)
-2. Sign in or create an account
-3. Navigate to the API section
-4. Generate a new API key
-5. Copy and paste it into the DataBayt.AI Studio settings
-
-**Important**: Your API key should start with `sk-` and is sensitive information. Keep it secure!
-
-## 📁 Data Format Support
-
-### JSON Format
-```json
-[
-  {
-    "text": "Your text content here",
-    "annotation": "Optional existing label"
-  },
-  {
-    "content": "Alternative content field name",
-    "label": "Alternative label field name"
-  }
-]
-```
-
-### CSV Format
-```csv
-text,label
-"Your text content here","Optional existing label"
-"Another text sample","Another label"
-```
-
-### TXT Format
-```
-Each line represents a separate data point
-This is another data point
-And this is a third one
-```
-
-## 📖 Usage Guide
-
-### 1. Upload Your Data
-
-- Click the upload button (📁) in the top toolbar
-- Select a JSON, CSV, or TXT file containing your data
-- The app will automatically parse and load your data points
-
-### 2. Configure AI Provider
-
-- Click the Settings button (⚙️)
-- Choose your preferred model provider:
-  - **OpenAI GPT**: Most accurate, requires API key
-  - **Anthropic Claude**: Alternative AI provider (placeholder implementation)
-  - **Local Model**: Simple rule-based model for testing
-
-### 3. Customize Annotation Fields (New!)
-
-You can now customize the annotation interface to match your specific needs:
-
-1. Click the **Customize** button in the "Human Annotation" section.
-2. Use the **XML Editor** to define your fields.
-3. You can add text inputs, textareas, checkboxes, radio buttons, and select dropdowns.
-4. Use `{{columnName}}` to insert values from your data file dynamically.
-
-**Example XML Config:**
-```xml
-<View>
-  <Header value="Sentiment Analysis"/>
-  <Text name="text" value="$text"/>
-  <Choices name="sentiment" toName="text" choice="single">
-    <Choice value="Positive"/>
-    <Choice value="Negative"/>
-    <Choice value="Neutral"/>
-  </Choices>
-  <TextArea name="reasoning" toName="text" placeholder="Why this sentiment?"/>
-</View>
-```
-
-### 4. Add Custom Prompt (Optional)
-
-In the settings dialog, you can add a custom prompt that will be sent to the AI along with each data point:
-
-```
-Please classify the following text as positive, negative, or neutral sentiment.
-Provide a brief explanation for your classification.
-```
-
-### 4. Process with AI
-
-- Click "Process All with AI" to send all data points to your chosen AI provider
-- The AI will generate suggested annotations for each data point
-- You'll see confidence scores for each suggestion
-
-### 5. Review and Refine
-
-For each data point, you can:
-- **Accept**: Use the AI's suggestion as-is
-- **Edit**: Modify the AI's suggestion
-- **Reject & Reset**: Discard the AI suggestion and start over
-
-### 6. Navigate and Track Progress
-
-- Use the arrow buttons or keyboard shortcuts (← →) to navigate between data points
-- Monitor your progress with the visual progress bar
-- View completion statistics in the actions panel
-
-### 7. Export Results
-
-- Click the download button (💾) to export your annotated data
-- Results are saved as a JSON file containing:
-  - Original content
-  - Original annotations (if any)
-  - AI suggestions
-  - Final annotations
-  - Status and confidence scores
-
-## ⌨️ Keyboard Shortcuts
-
-- `←` / `→`: Navigate between data points
-- `E`: Toggle edit mode
-- `S`: Save current annotation
-- `?`: Show keyboard shortcuts help
-
-## 📂 Sample Data
-
-The project includes sample data files in the `public` folder:
-
-- `sample-data.json`: JSON format with text and annotations
-- `sample-csv.csv`: CSV format with text and labels
-- `sample-text.txt`: Plain text format
-
-You can download and use these files to test the application.
-
-## 🔧 Technical Details
-
-### Built With
-
-- **React 18**: Modern React with hooks
-- **TypeScript**: Type-safe development
-- **Vite**: Fast build tool and dev server
-- **Tailwind CSS**: Utility-first CSS framework
-- **shadcn/ui**: High-quality UI components
-- **OpenAI SDK**: Official OpenAI API integration
-- **Lucide React**: Beautiful icons
-
-### Project Structure
-
-```
-src/
-├── components/
-│   ├── ui/                     # shadcn/ui components
-│   └── DataLabelingWorkspace.tsx  # Main application component
-├── services/
-│   └── aiProviders.ts          # AI provider integrations
-├── pages/
-│   └── Index.tsx              # Main page
-└── lib/
-    └── utils.ts               # Utility functions
-server/
-└── index.js                   # Backend proxy server
-```
-
-## 🚨 Security Notes
-
-- API keys are stored in browser localStorage and sent to your **local** server proxy
-- No data is sent to external servers other than the chosen AI provider
-- Requests are routed through the local server (`server/index.js`) to handle CORS and security
-- **Production**: When deploying, you must deploy the server component to handle these API requests
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-1. **"OpenAI API key is required" error**
-   - Make sure you've entered a valid API key starting with `sk-`
-   - Check that you've saved the settings after entering the key
-
-2. **File upload fails**
-   - Ensure your file is in JSON, CSV, or TXT format
-   - Check that JSON files contain a valid array structure
-   - Verify CSV files have appropriate column headers
-
-3. **AI processing fails**
-   - Verify your API key is correct and has sufficient credits
-   - Check your internet connection
-   - Try with a smaller dataset first
-
-### Getting Help
-
-If you encounter issues:
-1. Check the browser console for error messages
-2. Verify your API key and internet connection
-3. Try with the provided sample data files
-4. Ensure you're using a supported file format
-
-## 📄 License
-
-This project is part of the DataBayt.AI suite. Please refer to your license agreement for terms of use.
+![DataBayt demo](docs/assets/demo.gif)
 
 ---
 
-**DataBayt.AI Studio** - Accelerating data annotation with AI-powered assistance.
+## Why DataBayt.AI Studio?
+
+> Annotation tools shouldn't lock your data into a cloud you don't control.
+
+DataBayt.AI Studio gives your team a complete annotation environment — with AI-assisted labeling, inter-annotator agreement tracking, role-based access, and bilingual (Arabic/English) support — running entirely on your own infrastructure.
+
+---
+
+## Feature Highlights
+
+### Annotation Workspace
+
+| Capability | Details |
+| --- | --- |
+| **Upload formats** | JSON, CSV, TXT, Hugging Face datasets |
+| **Annotation modes** | Record view · List view with filters |
+| **AI assistance** | Accept / Edit / Reject loop with confidence scores |
+| **Custom forms** | XML-based config or visual drag-and-drop builder |
+| **Keyboard shortcuts** | Full shortcut set + in-app reference panel |
+| **Comments** | Threaded comments per data point |
+| **Undo / Redo** | Full edit history within a session |
+
+### AI & Model Management
+
+- Connect any provider: **OpenAI, Anthropic, OpenRouter, SambaNova, Ollama (local)**
+- Build **model profiles** (prompt, temperature, max tokens, pricing)
+- Set per-project **allowed/default profiles** via model policies
+- **Token estimation** and cost-aware batch processing
+- **Hugging Face** dataset import and private repo publishing
+
+### Team Collaboration
+
+- **Role-based access**: `admin` · `manager` · `annotator`
+- **Invite-link onboarding** with expiry, max-use limits, and role presets
+- **In-app notifications** with deep-link navigation
+- **Audit log** for uploads, AI runs, exports, and assignments
+- **Version history** — snapshot and restore any project state
+- **Annotation guidelines** — rich Markdown, always one click away
+
+### Quality Assurance
+
+- **Inter-Annotator Agreement (IAA)** — configurable sampling rate and annotator count
+- **IAA Dashboard** — per-item agreement scores with adjustable threshold slider
+- **Annotator Stats** — speed, edit rate, rejection rate, agreement breakdown
+- **Quality charts** — speed-by-annotator bar chart and per-annotator breakdown table
+
+### Bilingual Interface
+
+- Full **Arabic** and **English** UI — every string, label, and message
+- **RTL layout** switching with Cairo font for crisp Arabic rendering
+- Language preference persisted in `localStorage`
+- Relative dates localized (`date-fns` Arabic locale)
+
+### Security
+
+- **JWT authentication** (8 h expiry, stored in `sessionStorage`)
+- **bcrypt** password hashing (rounds = 12), transparent migration from legacy plaintext
+- `helmet` security headers + login **rate limiting** (10 req / 15 min)
+- API keys **masked** in all client responses
+- CORS configurable via `ALLOWED_ORIGINS`
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+| --- | --- |
+| Frontend | React 18 · TypeScript · Vite · Tailwind CSS · shadcn/ui |
+| Backend | Express 5 (ESM) · Node.js ≥ 18 |
+| Database | SQLite via `better-sqlite3` (WAL mode) |
+| Auth | `jsonwebtoken` · `bcryptjs` |
+| AI Providers | OpenAI · Anthropic · OpenRouter · SambaNova · Ollama |
+| i18n | i18next · react-i18next · i18next-browser-languagedetector |
+| Extras | `driver.js` · `js-tiktoken` · `@huggingface/hub` |
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- **Node.js 18+**
+
+### 1 — Install dependencies
+
+```bash
+npm install
+```
+
+### 2 — Configure environment
+
+```bash
+cp .env.example .env
+```
+
+```env
+# Required
+JWT_SECRET=your-random-secret-at-least-32-chars
+
+# Optional
+PORT=3000
+DATA_DIR=server/data
+ALLOWED_ORIGINS=http://localhost:8080
+```
+
+> The server will warn on startup if `JWT_SECRET` is missing. Always set it in production.
+
+### 3 — Run
+
+```bash
+npm run dev:all
+```
+
+Frontend: `http://localhost:8080` · Backend: `http://localhost:3000`
+
+### Default credentials
+
+| Username | Password | Note |
+| --- | --- | --- |
+| `admin` | `admin` | Password change required on first login |
+
+---
+
+## Guided Onboarding
+
+Every new user gets:
+
+- An **interactive tutorial** (dashboard + workspace) powered by driver.js — deferred until after forced password change
+- A **demo practice project** (sentiment analysis, 10 pre-labeled samples) to explore the workspace immediately
+
+---
+
+## Project Structure
+
+```text
+src/
+├── components/
+│   ├── DataLabelingWorkspace.tsx   # Main annotation workspace
+│   ├── FormBuilder.tsx             # Visual annotation form builder
+│   ├── DynamicAnnotationForm.tsx   # Runtime form renderer
+│   ├── NotificationBell.tsx        # In-app notifications
+│   ├── VersionHistory.tsx          # Snapshot & restore
+│   ├── TemplatePickerModal.tsx     # Built-in + custom templates
+│   ├── qa/
+│   │   ├── AnnotationQualityDashboard.tsx
+│   │   └── IAADashboard.tsx
+│   └── Tutorial/
+│       ├── tourSteps.ts            # Dashboard & workspace tour steps
+│       └── useTutorial.ts
+├── pages/
+│   ├── Dashboard.tsx               # Projects, user management, login
+│   ├── ModelManagement.tsx         # Providers, profiles, policies
+│   └── ProjectSettings.tsx
+├── contexts/
+│   ├── AuthContext.tsx
+│   └── LanguageContext.tsx         # RTL/LTR + language switching
+├── i18n/
+│   ├── index.ts                    # i18next configuration
+│   └── locales/
+│       ├── en.json                 # English strings
+│       └── ar.json                 # Arabic strings
+└── services/
+    ├── apiClient.ts
+    ├── xmlConfigService.ts
+    └── exportService.ts
+
+server/
+├── index.js                        # Express app + middleware
+├── middleware/auth.js               # JWT verify, requireAuth, requireRole
+├── routes/
+│   ├── projects.js                 # Projects, data points, snapshots, audit
+│   ├── users.js                    # Auth, user CRUD, invite tokens
+│   └── models.js                   # Connections, profiles, policies
+└── services/
+    ├── database.js                 # SQLite schema, migrations, seed
+    └── notificationService.js
+```
+
+---
+
+## Access Control
+
+| Role | Capabilities |
+| --- | --- |
+| `admin` | Full access — users, all projects, model management |
+| `manager` | Manage assigned projects, annotator assignments, model management |
+| `annotator` | Access only assigned projects; annotate data |
+
+---
+
+## Data Formats
+
+| Format | Behavior |
+| --- | --- |
+| **CSV** | All columns preserved as metadata; choose display columns in workspace |
+| **JSON** | Flexible payloads — text and image-style records supported |
+| **TXT** | Each line becomes a separate annotation item |
+| **Hugging Face** | Browse and import public datasets directly from the workspace |
+
+---
+
+## Deployment
+
+```bash
+# Build frontend
+npm run build
+
+# Start production server
+npm start
+```
+
+- Serve the `dist/` folder as static files from the same Express process or a reverse proxy (nginx).
+- Set `JWT_SECRET` to a strong random value: `openssl rand -hex 32`
+- SQLite database is created at `server/data/databayt.sqlite` — override with `DATA_DIR`.
+- All provider API keys are stored server-side and never exposed in full to clients.
+
+---
+
+## Troubleshooting
+
+### Provider / model list not loading
+
+- Confirm backend is running: `npm run dev:all`
+- Verify API key in **Model Management → Connections**
+- Check browser Network tab for proxy route errors (`/api/openai/*`, etc.)
+
+### Upload issues
+
+- Confirm file is valid JSON / CSV / TXT
+- For CSV, ensure column headers are present in the first row
+
+### AI processing errors
+
+- Verify the model profile has an active provider connection
+- Check API key credits / rate limits
+- For Ollama, confirm the endpoint is reachable: `http://localhost:11434`
+
+### Access denied on project or model pages
+
+- Confirm the user's role and project assignment in **User Management**
+
+### 401 after server restart
+
+- `sessionStorage` tokens are tab-scoped and do not survive a browser session restart — simply log in again
+
+---
+
+## License
+
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
+
+You are free to use, modify, and distribute this software under the terms of the AGPL-3.0. Any modified version deployed as a network service must also be made available under the same license.
+
+See the [LICENSE](LICENSE) file for full details.
+
+---
+
+Built with care by the **DataBayt** team.

@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import { useAuth } from "@/contexts/AuthContext";
 import { modelManagementService } from "@/services/modelManagementService";
+import { getAuthToken } from "@/services/apiClient";
+import { generateId } from "@/lib/utils";
 import { projectService } from "@/services/projectService";
 import { AVAILABLE_PROVIDERS } from "@/services/aiProviders";
 import type { ModelProfile, Project, ProjectModelPolicy, ProviderConnection } from "@/types/data";
@@ -26,6 +29,7 @@ type RuntimeModelOption = {
 
 const ModelManagement = () => {
   const navigate = useNavigate();
+  const { t } = useTranslation();
   const { currentUser } = useAuth();
   const isManager = currentUser?.roles?.includes("manager") || currentUser?.roles?.includes("admin");
 
@@ -58,14 +62,25 @@ const ModelManagement = () => {
   const [remoteModelsByConnection, setRemoteModelsByConnection] = useState<Record<string, RuntimeModelOption[]>>({});
   const [isLoadingRemoteModels, setIsLoadingRemoteModels] = useState(false);
   const [remoteModelsError, setRemoteModelsError] = useState<string | null>(null);
+  const isOfficialProvider = useCallback((providerId: string) =>
+    providerId === "openai"
+    || providerId === "anthropic"
+    || providerId === "openrouter"
+    || providerId === "gemini", []);
 
   useEffect(() => {
-    projectService.initialize().then(async () => {
+    const init = async () => {
+      await Promise.all([
+        projectService.initialize(),
+        modelManagementService.initialize()
+      ]);
+
       const loadedProjects = await projectService.getAll();
       setProjects(loadedProjects);
-    });
-    setConnections(modelManagementService.getConnections());
-    setProfiles(modelManagementService.getProfiles());
+      setConnections(modelManagementService.getConnections());
+      setProfiles(modelManagementService.getProfiles());
+    };
+    init();
   }, []);
 
   useEffect(() => {
@@ -87,9 +102,7 @@ const ModelManagement = () => {
     ? (providerLookup.get(selectedProfileConnection.providerId)?.models ?? [])
     : [];
   const baseModelsForSelectedConnection = selectedProfileConnection
-    && (selectedProfileConnection.providerId === "openai"
-      || selectedProfileConnection.providerId === "anthropic"
-      || selectedProfileConnection.providerId === "openrouter")
+    && isOfficialProvider(selectedProfileConnection.providerId)
     ? (remoteModelsByConnection[selectedProfileConnection.id] ?? [])
     : staticModelsForConnection;
   const modelsForSelectedConnection = useMemo(() => {
@@ -104,28 +117,24 @@ const ModelManagement = () => {
   }, [profiles]);
 
   const fetchOfficialModels = useCallback(async (connection: ProviderConnection, force = false) => {
-    if (connection.providerId !== "openai"
-      && connection.providerId !== "anthropic"
-      && connection.providerId !== "openrouter") return;
-    if (!connection.apiKey) {
+    if (!isOfficialProvider(connection.providerId)) return;
+    if (!connection.hasApiKey) {
       setRemoteModelsError("API key is required to load official provider models.");
       return;
     }
     if (!force && remoteModelsByConnection[connection.id]?.length) return;
 
-    const endpoint =
-      connection.providerId === "openai"
-        ? "/api/openai/models"
-        : connection.providerId === "anthropic"
-          ? "/api/anthropic/models"
-          : "/api/openrouter/models";
     setIsLoadingRemoteModels(true);
     setRemoteModelsError(null);
     try {
-      const response = await fetch(endpoint, {
-        headers: {
-          Authorization: `Bearer ${connection.apiKey}`
-        }
+      const providerEndpoint =
+        connection.providerId === "openai" ? "/api/openai/models" :
+        connection.providerId === "anthropic" ? "/api/anthropic/models" :
+        connection.providerId === "openrouter" ? "/api/openrouter/models" :
+        "/api/gemini/models";
+      const token = getAuthToken();
+      const response = await fetch(`${providerEndpoint}?connectionId=${encodeURIComponent(connection.id)}`, {
+        headers: { Authorization: `Bearer ${token}` }
       });
       const contentType = response.headers.get("content-type") || "";
       if (!contentType.includes("application/json")) {
@@ -168,20 +177,18 @@ const ModelManagement = () => {
     } finally {
       setIsLoadingRemoteModels(false);
     }
-  }, [remoteModelsByConnection]);
+  }, [isOfficialProvider, remoteModelsByConnection]);
 
   useEffect(() => {
     if (!profileConnectionId) return;
     const connection = connectionLookup.get(profileConnectionId);
     if (!connection) return;
-    if (connection.providerId !== "openai"
-      && connection.providerId !== "anthropic"
-      && connection.providerId !== "openrouter") {
+    if (!isOfficialProvider(connection.providerId)) {
       setRemoteModelsError(null);
       return;
     }
     fetchOfficialModels(connection, false);
-  }, [profileConnectionId, connectionLookup, fetchOfficialModels]);
+  }, [profileConnectionId, connectionLookup, fetchOfficialModels, isOfficialProvider]);
 
   useEffect(() => {
     if (editingProfileId) return;
@@ -195,24 +202,24 @@ const ModelManagement = () => {
   const handleTestProfile = async (profile: ModelProfile) => {
     const connection = connectionLookup.get(profile.providerConnectionId);
     if (!connection) {
-      toast({ title: "Missing connection", description: "Provider connection not found." });
+      toast({ title: t("models.missingConnection"), description: t("models.connectionNotFound") });
       return;
     }
     if (!connection.isActive) {
-      toast({ title: "Connection inactive", description: "Activate the connection before testing." });
+      toast({ title: t("models.connectionInactive"), description: t("models.activateConnection") });
       return;
     }
     if (!profile.isActive) {
-      toast({ title: "Profile inactive", description: "Activate the profile before testing." });
+      toast({ title: t("models.profileInactive"), description: t("models.activateProfile") });
       return;
     }
     const providerInfo = providerLookup.get(connection.providerId);
     if (!providerInfo) {
-      toast({ title: "Unknown provider", description: "Provider is not available." });
+      toast({ title: t("models.unknownProvider"), description: t("models.providerNotAvailable") });
       return;
     }
-    if (providerInfo.requiresApiKey && !connection.apiKey) {
-      toast({ title: "Missing API key", description: "Add an API key before testing." });
+    if (providerInfo.requiresApiKey && !connection.hasApiKey) {
+      toast({ title: t("models.missingApiKey"), description: t("models.addApiKeyFirst") });
       return;
     }
 
@@ -224,22 +231,23 @@ const ModelManagement = () => {
       const result = await provider.processText(
         "Say 'pong' if you can read this.",
         "Respond with a single word.",
-        connection.apiKey,
+        connection.id,
         profile.modelId,
         baseUrl,
         "text",
         {
           temperature: profile.temperature,
-          maxTokens: profile.maxTokens
+          maxTokens: profile.maxTokens,
+          jwtToken: getAuthToken() ?? undefined,
         }
       );
       toast({
-        title: "Profile OK",
+        title: t("models.profileOK"),
         description: `Response: ${result.slice(0, 120)}`
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
-      toast({ title: "Profile test failed", description: message, variant: "destructive" });
+      toast({ title: t("models.profileTestFailed"), description: message, variant: "destructive" });
     } finally {
       setTestingProfileId(null);
     }
@@ -255,8 +263,8 @@ const ModelManagement = () => {
                 <span className="text-white font-semibold">DB</span>
               </div>
               <div>
-                <h1 className="text-xl font-semibold text-foreground">Access Denied</h1>
-                <p className="text-sm text-muted-foreground">Manager role required.</p>
+                <h1 className="text-xl font-semibold text-foreground">{t("models.accessDenied")}</h1>
+                <p className="text-sm text-muted-foreground">{t("models.managerRoleRequired")}</p>
               </div>
             </div>
             <ThemeToggle />
@@ -264,11 +272,11 @@ const ModelManagement = () => {
           </div>
           <Card className="p-6">
             <p className="text-sm text-muted-foreground">
-              Ask an admin or manager to grant access to model management.
+              {t("models.askAdminManager")}
             </p>
             <div className="mt-4 flex gap-2">
               <Button variant="outline" onClick={() => navigate("/")}>
-                Back to Dashboard
+                {t("models.backToDashboard")}
               </Button>
             </div>
           </Card>
@@ -301,12 +309,12 @@ const ModelManagement = () => {
 
   const handleSaveConnection = () => {
     if (!connectionProviderId || !connectionName.trim()) {
-      toast({ title: "Missing fields", description: "Provider and name are required." });
+      toast({ title: t("models.missingFields"), description: t("models.providerNameRequired") });
       return;
     }
     const now = Date.now();
     const connection: ProviderConnection = {
-      id: editingConnectionId ?? crypto.randomUUID(),
+      id: editingConnectionId ?? generateId(),
       providerId: connectionProviderId as ProviderConnection["providerId"],
       name: connectionName.trim(),
       apiKey: connectionApiKey.trim() || undefined,
@@ -336,12 +344,12 @@ const ModelManagement = () => {
 
   const handleSaveProfile = () => {
     if (!profileConnectionId || !profileModelId || !profileDisplayName.trim()) {
-      toast({ title: "Missing fields", description: "Connection, model, and name are required." });
+      toast({ title: t("models.missingFields"), description: t("models.connectionModelNameRequired") });
       return;
     }
     const now = Date.now();
     const profile: ModelProfile = {
-      id: editingProfileId ?? crypto.randomUUID(),
+      id: editingProfileId ?? generateId(),
       providerConnectionId: profileConnectionId,
       modelId: profileModelId,
       displayName: profileDisplayName.trim(),
@@ -386,7 +394,7 @@ const ModelManagement = () => {
       updatedAt: Date.now()
     };
     modelManagementService.saveProjectPolicy(policy);
-    toast({ title: "Policy saved", description: "Project model policy updated." });
+    toast({ title: t("models.policySaved"), description: t("models.projectPolicyUpdated") });
   };
 
   return (
@@ -394,11 +402,11 @@ const ModelManagement = () => {
       <div className="max-w-6xl mx-auto space-y-8">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-semibold">Model Management</h1>
-            <p className="text-sm text-muted-foreground">Configure provider connections and model profiles.</p>
+            <h1 className="text-2xl font-semibold">{t("models.title")}</h1>
+            <p className="text-sm text-muted-foreground">{t("models.pageSubtitle")}</p>
           </div>
           <div className="flex items-center gap-3">
-            <Button variant="outline" onClick={() => navigate("/")}>Back to Dashboard</Button>
+            <Button variant="outline" onClick={() => navigate("/")}>{t("models.backToDashboard")}</Button>
             <ThemeToggle />
             <UserMenu />
           </div>
@@ -407,16 +415,16 @@ const ModelManagement = () => {
         <Card className="p-6 space-y-6">
           <div className="flex items-center justify-between">
             <div>
-              <h2 className="text-lg font-semibold">Provider Connections</h2>
-              <p className="text-xs text-muted-foreground">Store API keys and base URLs in one place.</p>
+              <h2 className="text-lg font-semibold">{t("models.providerConnections")}</h2>
+              <p className="text-xs text-muted-foreground">{t("models.storeAPIKeys")}</p>
             </div>
           </div>
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-3">
-              <Label>Provider</Label>
+              <Label>{t("models.provider")}</Label>
               <Select value={connectionProviderId} onValueChange={setConnectionProviderId}>
                 <SelectTrigger>
-                  <SelectValue placeholder="Select provider" />
+                  <SelectValue placeholder={t("models.selectProvider")} />
                 </SelectTrigger>
                 <SelectContent>
                   {AVAILABLE_PROVIDERS.map(provider => (
@@ -426,15 +434,15 @@ const ModelManagement = () => {
               </Select>
             </div>
             <div className="space-y-3">
-              <Label>Connection Name</Label>
+              <Label>{t("models.connectionName")}</Label>
               <Input value={connectionName} onChange={(e) => setConnectionName(e.target.value)} placeholder="OpenAI Prod" />
             </div>
             <div className="space-y-3">
-              <Label>API Key</Label>
+              <Label>{t("models.apiKey")}</Label>
               <Input type="password" value={connectionApiKey} onChange={(e) => setConnectionApiKey(e.target.value)} placeholder="sk-..." />
             </div>
             <div className="space-y-3">
-              <Label>Base URL (optional)</Label>
+              <Label>{t("models.baseUrlOptional")}</Label>
               <Input value={connectionBaseUrl} onChange={(e) => setConnectionBaseUrl(e.target.value)} placeholder="http://localhost:11434" />
             </div>
             <div className="flex items-center gap-2">
@@ -443,15 +451,15 @@ const ModelManagement = () => {
                 checked={connectionIsActive}
                 onCheckedChange={(checked) => setConnectionIsActive(!!checked)}
               />
-              <Label htmlFor="connection-active" className="text-sm font-normal">Active</Label>
+              <Label htmlFor="connection-active" className="text-sm font-normal">{t("models.active")}</Label>
             </div>
           </div>
           <div className="flex gap-2">
             <Button onClick={handleSaveConnection}>
-              {editingConnectionId ? "Update Connection" : "Add Connection"}
+              {editingConnectionId ? t("models.updateConnection") : t("models.addConnection")}
             </Button>
             {editingConnectionId && (
-              <Button variant="outline" onClick={resetConnectionForm}>Cancel</Button>
+              <Button variant="outline" onClick={resetConnectionForm}>{t("common.cancel")}</Button>
             )}
           </div>
 
@@ -459,19 +467,19 @@ const ModelManagement = () => {
 
           <div className="space-y-3">
             {connections.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No provider connections yet.</p>
+              <p className="text-sm text-muted-foreground">{t("models.noProviderConnections")}</p>
             ) : (
               connections.map(connection => (
                 <div key={connection.id} className="flex items-center justify-between border rounded-md p-3">
                   <div>
                     <div className="font-medium">{connection.name}</div>
                     <div className="text-xs text-muted-foreground">
-                      {providerLookup.get(connection.providerId)?.name} · {connection.isActive ? "Active" : "Inactive"}
+                      {providerLookup.get(connection.providerId)?.name} · {connection.isActive ? t("models.active") : t("models.inactive")}
                     </div>
                   </div>
                   <div className="flex gap-2">
-                    <Button size="sm" variant="outline" onClick={() => handleEditConnection(connection)}>Edit</Button>
-                    <Button size="sm" variant="destructive" onClick={() => handleDeleteConnection(connection.id)}>Delete</Button>
+                    <Button size="sm" variant="outline" onClick={() => handleEditConnection(connection)}>{t("common.edit")}</Button>
+                    <Button size="sm" variant="destructive" onClick={() => handleDeleteConnection(connection.id)}>{t("common.delete")}</Button>
                   </div>
                 </div>
               ))
@@ -481,15 +489,15 @@ const ModelManagement = () => {
 
         <Card className="p-6 space-y-6">
           <div>
-            <h2 className="text-lg font-semibold">Model Profiles</h2>
-            <p className="text-xs text-muted-foreground">Bundle model + connection into a selectable profile.</p>
+            <h2 className="text-lg font-semibold">{t("models.modelProfiles")}</h2>
+            <p className="text-xs text-muted-foreground">{t("models.bundleModel")}</p>
           </div>
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-3">
-              <Label>Connection</Label>
+              <Label>{t("models.connections")}</Label>
               <Select value={profileConnectionId} onValueChange={setProfileConnectionId}>
                 <SelectTrigger>
-                  <SelectValue placeholder="Select connection" />
+                  <SelectValue placeholder={t("models.selectConnection")} />
                 </SelectTrigger>
                 <SelectContent>
                   {connectionOptions.map(connection => (
@@ -500,11 +508,9 @@ const ModelManagement = () => {
             </div>
             <div className="space-y-3">
               <div className="flex items-center justify-between">
-                <Label>Model</Label>
+                <Label>{t("models.model")}</Label>
                 {selectedProfileConnection && (
-                  selectedProfileConnection.providerId === "openai"
-                  || selectedProfileConnection.providerId === "anthropic"
-                  || selectedProfileConnection.providerId === "openrouter"
+                  isOfficialProvider(selectedProfileConnection.providerId)
                 ) && (
                     <Button
                       type="button"
@@ -514,13 +520,13 @@ const ModelManagement = () => {
                       onClick={() => fetchOfficialModels(selectedProfileConnection, true)}
                       disabled={isLoadingRemoteModels}
                     >
-                      {isLoadingRemoteModels ? "Loading..." : "Refresh"}
+                      {isLoadingRemoteModels ? t("models.loading") : t("models.refresh")}
                     </Button>
                   )}
               </div>
               <Select value={profileModelId} onValueChange={setProfileModelId}>
                 <SelectTrigger>
-                  <SelectValue placeholder="Select model" />
+                  <SelectValue placeholder={t("models.selectModel")} />
                 </SelectTrigger>
                 <SelectContent>
                   {modelsForSelectedConnection.map(model => (
@@ -529,41 +535,39 @@ const ModelManagement = () => {
                 </SelectContent>
               </Select>
               {selectedProfileConnection && (
-                selectedProfileConnection.providerId === "openai"
-                || selectedProfileConnection.providerId === "anthropic"
-                || selectedProfileConnection.providerId === "openrouter"
+                isOfficialProvider(selectedProfileConnection.providerId)
               ) && (
                   <p className="text-xs text-muted-foreground">
                     {remoteModelsError
-                      ? `Could not load provider models: ${remoteModelsError}`
+                      ? t("models.couldNotLoadModels", { error: remoteModelsError })
                       : modelsForSelectedConnection.length === 0
-                        ? "No models loaded yet. Check API key and click Refresh."
-                        : "Loaded from provider API."}
+                        ? t("models.noModelsLoaded")
+                        : t("models.loadedFromProvider")}
                   </p>
                 )}
             </div>
             <div className="space-y-3">
-              <Label>Display Name</Label>
-              <Input value={profileDisplayName} onChange={(e) => setProfileDisplayName(e.target.value)} placeholder="GPT-4o Mini (Prod)" />
+              <Label>{t("models.displayName")}</Label>
+              <Input value={profileDisplayName} onChange={(e) => setProfileDisplayName(e.target.value)} placeholder={t("models.displayNamePlaceholder")} />
             </div>
             <div className="space-y-3">
-              <Label>Default Prompt (optional)</Label>
+              <Label>{t("models.defaultPromptOptional")}</Label>
               <Textarea value={profileDefaultPrompt} onChange={(e) => setProfileDefaultPrompt(e.target.value)} rows={3} />
             </div>
             <div className="space-y-3">
-              <Label>Temperature (optional)</Label>
+              <Label>{t("models.temperatureOptional")}</Label>
               <Input value={profileTemperature} onChange={(e) => setProfileTemperature(e.target.value)} placeholder="0.2" />
             </div>
             <div className="space-y-3">
-              <Label>Max Tokens (optional)</Label>
+              <Label>{t("models.maxTokensOptional")}</Label>
               <Input value={profileMaxTokens} onChange={(e) => setProfileMaxTokens(e.target.value)} placeholder="1024" />
             </div>
             <div className="space-y-3">
-              <Label>Input Price / 1M tokens (optional)</Label>
+              <Label>{t("models.inputPriceOptional")}</Label>
               <Input value={profileInputPrice} onChange={(e) => setProfileInputPrice(e.target.value)} placeholder="0.15" />
             </div>
             <div className="space-y-3">
-              <Label>Output Price / 1M tokens (optional)</Label>
+              <Label>{t("models.outputPriceOptional")}</Label>
               <Input value={profileOutputPrice} onChange={(e) => setProfileOutputPrice(e.target.value)} placeholder="0.60" />
             </div>
             <div className="flex items-center gap-2">
@@ -572,15 +576,15 @@ const ModelManagement = () => {
                 checked={profileIsActive}
                 onCheckedChange={(checked) => setProfileIsActive(!!checked)}
               />
-              <Label htmlFor="profile-active" className="text-sm font-normal">Active</Label>
+              <Label htmlFor="profile-active" className="text-sm font-normal">{t("models.active")}</Label>
             </div>
           </div>
           <div className="flex gap-2">
             <Button onClick={handleSaveProfile}>
-              {editingProfileId ? "Update Profile" : "Add Profile"}
+              {editingProfileId ? t("models.updateProfile") : t("models.addProfileBtn")}
             </Button>
             {editingProfileId && (
-              <Button variant="outline" onClick={resetProfileForm}>Cancel</Button>
+              <Button variant="outline" onClick={resetProfileForm}>{t("common.cancel")}</Button>
             )}
           </div>
 
@@ -588,7 +592,7 @@ const ModelManagement = () => {
 
           <div className="space-y-3">
             {profiles.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No model profiles yet.</p>
+              <p className="text-sm text-muted-foreground">{t("models.noModelProfiles")}</p>
             ) : (
               profiles.map(profile => {
                 const connection = connectionLookup.get(profile.providerConnectionId);
@@ -598,7 +602,7 @@ const ModelManagement = () => {
                     <div>
                       <div className="font-medium">{profile.displayName}</div>
                       <div className="text-xs text-muted-foreground">
-                        {providerName} · {profile.modelId} · {profile.isActive ? "Active" : "Inactive"}
+                        {providerName} · {profile.modelId} · {profile.isActive ? t("models.active") : t("models.inactive")}
                       </div>
                     </div>
                     <div className="flex gap-2">
@@ -611,14 +615,14 @@ const ModelManagement = () => {
                         {testingProfileId === profile.id ? (
                           <>
                             <Loader2 className="w-3 h-3 mr-1 animate-spin" />
-                            Testing
+                            {t("models.testing")}
                           </>
                         ) : (
-                          "Test"
+                          t("models.test")
                         )}
                       </Button>
-                      <Button size="sm" variant="outline" onClick={() => handleEditProfile(profile)}>Edit</Button>
-                      <Button size="sm" variant="destructive" onClick={() => handleDeleteProfile(profile.id)}>Delete</Button>
+                      <Button size="sm" variant="outline" onClick={() => handleEditProfile(profile)}>{t("common.edit")}</Button>
+                      <Button size="sm" variant="destructive" onClick={() => handleDeleteProfile(profile.id)}>{t("common.delete")}</Button>
                     </div>
                   </div>
                 );
@@ -629,14 +633,14 @@ const ModelManagement = () => {
 
         <Card className="p-6 space-y-6">
           <div>
-            <h2 className="text-lg font-semibold">Project Model Policy</h2>
-            <p className="text-xs text-muted-foreground">Choose which profiles are available per project.</p>
+            <h2 className="text-lg font-semibold">{t("models.projectModelPolicy")}</h2>
+            <p className="text-xs text-muted-foreground">{t("models.chooseProfiles")}</p>
           </div>
           <div className="space-y-3">
-            <Label>Project</Label>
+            <Label>{t("models.project")}</Label>
             <Select value={selectedProjectId} onValueChange={setSelectedProjectId}>
               <SelectTrigger>
-                <SelectValue placeholder="Select project" />
+                <SelectValue placeholder={t("models.selectProject")} />
               </SelectTrigger>
               <SelectContent>
                 {projects.map(project => (
@@ -648,10 +652,10 @@ const ModelManagement = () => {
           {selectedProjectId && (
             <div className="grid gap-6 md:grid-cols-2">
               <div className="space-y-2">
-                <Label>Allowed Profiles</Label>
+                <Label>{t("models.allowedProfiles")}</Label>
                 <div className="space-y-2 border rounded-md p-3 max-h-64 overflow-y-auto">
                   {profileOptions.length === 0 && (
-                    <p className="text-xs text-muted-foreground">No active profiles to assign.</p>
+                    <p className="text-xs text-muted-foreground">{t("models.noActiveProfiles")}</p>
                   )}
                   {profileOptions.map(profile => {
                     const checked = allowedProfiles.includes(profile.id);
@@ -678,10 +682,10 @@ const ModelManagement = () => {
                 </div>
               </div>
               <div className="space-y-2">
-                <Label>Default Profiles</Label>
+                <Label>{t("models.defaultProfiles")}</Label>
                 <div className="space-y-2 border rounded-md p-3 max-h-64 overflow-y-auto">
                   {allowedProfiles.length === 0 && (
-                    <p className="text-xs text-muted-foreground">Select allowed profiles first.</p>
+                    <p className="text-xs text-muted-foreground">{t("models.selectAllowedFirst")}</p>
                   )}
                   {allowedProfiles.map(profileId => {
                     const profile = profiles.find(item => item.id === profileId);
@@ -711,7 +715,7 @@ const ModelManagement = () => {
             </div>
           )}
           <div className="flex gap-2">
-            <Button onClick={handleSavePolicy} disabled={!selectedProjectId}>Save Policy</Button>
+            <Button onClick={handleSavePolicy} disabled={!selectedProjectId}>{t("models.savePolicy")}</Button>
           </div>
         </Card>
       </div>

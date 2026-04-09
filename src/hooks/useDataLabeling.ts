@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from "react";
-import { DataPoint, AnnotationStats } from "@/types/data";
+import { useState, useEffect, useCallback, useMemo } from "react";
+import { DataPoint, AnnotationStats, AnnotationAssignment, ProjectDataStatusCounts } from "@/types/data";
 import { projectService } from "@/services/projectService";
 import { useUndoRedo } from "./useUndoRedo";
 
@@ -9,6 +9,32 @@ interface WorkspaceState {
 }
 
 type AnnotatorMeta = { id: string; name: string };
+
+const DEFAULT_STATUS_COUNTS: ProjectDataStatusCounts = {
+    total: 0,
+    completed: 0,
+    remaining: 0,
+    accepted: 0,
+    edited: 0,
+    pending: 0,
+    aiProcessed: 0,
+    rejected: 0
+};
+
+const getAssignmentIndex = (dataPoint: DataPoint, annotatorId?: string) => {
+    if (!annotatorId || !dataPoint.assignments) return -1;
+    return dataPoint.assignments.findIndex(a => a.annotatorId === annotatorId);
+};
+
+const computeStatusAndFinal = (dataPoint: DataPoint, assignments?: AnnotationAssignment[]) => {
+    if (!assignments || assignments.length === 0) return { status: 'pending' as const, finalAnnotation: '' };
+    const required = dataPoint.isIAA ? Math.max(2, dataPoint.iaaRequiredCount ?? 2) : 1;
+    const doneAssignments = assignments.filter(a => a.status === 'done' && (a.value ?? '').trim().length > 0);
+    if (doneAssignments.length < required) {
+        return { status: 'pending' as const, finalAnnotation: '' };
+    }
+    return { status: 'accepted' as const, finalAnnotation: doneAssignments[0]?.value ?? '' };
+};
 
 export const useDataLabeling = (projectId?: string) => {
     // Undo/Redo State
@@ -33,10 +59,10 @@ export const useDataLabeling = (projectId?: string) => {
     const [isLoading, setIsLoading] = useState(true);
 
     // Pagination State
-    const [page, setPage] = useState(1);
+    const [page] = useState(1);
     const [totalItems, setTotalItems] = useState(0);
-    const [limit] = useState(50); // Default limit
     const [isLoadingData, setIsLoadingData] = useState(false);
+    const [statusCounts, setStatusCounts] = useState<ProjectDataStatusCounts>(DEFAULT_STATUS_COUNTS);
 
     // Stats
     const [sessionStart] = useState(Date.now());
@@ -72,7 +98,7 @@ export const useDataLabeling = (projectId?: string) => {
 
                     // 2. Get Data Points for current page
                     setIsLoadingData(true);
-                    const { dataPoints: loadedData, pagination } = await projectService.getData(projectId, page, limit);
+                    const { dataPoints: loadedData, pagination, statusCounts: loadedStatusCounts } = await projectService.getData(projectId, page);
 
                     if (loadedData) {
                         // Reset undo history when loading new project or page
@@ -80,7 +106,13 @@ export const useDataLabeling = (projectId?: string) => {
                             dataPoints: loadedData,
                             currentIndex: 0
                         });
-                        setTotalItems(pagination.total || 0);
+                        const globalTotal = pagination.total || 0;
+                        setTotalItems(globalTotal);
+                        setStatusCounts(loadedStatusCounts || {
+                            ...DEFAULT_STATUS_COUNTS,
+                            total: globalTotal,
+                            remaining: globalTotal
+                        });
 
                         if (loadedData.length > 0 && loadedData[0].customFieldName) {
                             setCustomFieldName(loadedData[0].customFieldName);
@@ -96,7 +128,7 @@ export const useDataLabeling = (projectId?: string) => {
             }
         };
         loadProject();
-    }, [projectId, page, limit, resetWorkspaceState]);
+    }, [projectId, page, resetWorkspaceState]);
 
     // Save progress - REMOVED auto-save effect
     // We now save individual data points as they change
@@ -128,8 +160,46 @@ export const useDataLabeling = (projectId?: string) => {
         };
     }, [dataPoints, sessionStart]);
 
-    const completedCount = dataPoints.filter(dp => dp.status === 'accepted' || dp.status === 'edited').length;
-    const isCompleted = dataPoints.length > 0 && completedCount === dataPoints.length;
+    const localStatusCounts = useMemo<ProjectDataStatusCounts>(() => {
+        const total = dataPoints.length;
+        const accepted = dataPoints.filter(dp => dp.status === 'accepted').length;
+        const edited = dataPoints.filter(dp => dp.status === 'edited').length;
+        const pending = dataPoints.filter(dp => dp.status === 'pending').length;
+        const aiProcessed = dataPoints.filter(dp => dp.status === 'ai_processed').length;
+        const rejected = dataPoints.filter(dp => dp.status === 'rejected').length;
+        const completed = accepted + edited;
+        const remaining = Math.max(0, total - completed);
+
+        return {
+            total,
+            completed,
+            remaining,
+            accepted,
+            edited,
+            pending,
+            aiProcessed,
+            rejected
+        };
+    }, [dataPoints]);
+
+    // Fallback to local counts when API counts are unavailable/stale (common right after local upload).
+    const shouldUseLocalFallback = statusCounts.total === 0 && localStatusCounts.total > 0;
+    const effectiveStatusCounts = shouldUseLocalFallback
+        ? {
+            ...localStatusCounts,
+            total: totalItems > 0 ? totalItems : localStatusCounts.total,
+            remaining: Math.max(
+                0,
+                (totalItems > 0 ? totalItems : localStatusCounts.total) - localStatusCounts.completed
+            )
+        }
+        : statusCounts;
+
+    const globalTotalItems = effectiveStatusCounts.total || totalItems || dataPoints.length;
+    const globalCompletedCount = effectiveStatusCounts.completed || 0;
+    const globalRemainingCount = Math.max(0, effectiveStatusCounts.remaining ?? (globalTotalItems - globalCompletedCount));
+    const globalProgress = globalTotalItems > 0 ? (globalCompletedCount / globalTotalItems) * 100 : 0;
+    const isCompleted = globalTotalItems > 0 && globalCompletedCount === globalTotalItems;
 
     // Update stats effect
     useEffect(() => {
@@ -163,11 +233,6 @@ export const useDataLabeling = (projectId?: string) => {
             });
             setIsEditMode(false);
             setTempAnnotation('');
-        } else if (page * limit < totalItems) {
-            // Next Page
-            setPage(p => p + 1);
-            setIsEditMode(false);
-            setTempAnnotation('');
         }
     };
 
@@ -179,13 +244,6 @@ export const useDataLabeling = (projectId?: string) => {
             });
             setIsEditMode(false);
             setTempAnnotation('');
-        } else if (page > 1) {
-            // Previous Page
-            setPage(p => p - 1);
-            setIsEditMode(false);
-            setTempAnnotation('');
-            // Note: When going back, we land on currentIndex 0 of previous page. 
-            // Ideally should land on last index of previous page, but 0 is simpler for now.
         }
     };
 
@@ -194,14 +252,46 @@ export const useDataLabeling = (projectId?: string) => {
     const handleAcceptAnnotation = (content: string, annotator?: AnnotatorMeta) => {
         if (!currentDataPoint) return;
         const updated = [...dataPoints];
-        updated[currentIndex] = {
-            ...currentDataPoint,
-            finalAnnotation: content,
-            status: 'accepted',
-            annotatorId: annotator?.id ?? currentDataPoint.annotatorId,
-            annotatorName: annotator?.name ?? currentDataPoint.annotatorName,
-            annotatedAt: annotator ? Date.now() : currentDataPoint.annotatedAt
-        };
+        const assignmentIndex = getAssignmentIndex(currentDataPoint, annotator?.id);
+
+        if (annotator?.id) {
+            const nextAssignments = [...(currentDataPoint.assignments ?? [])];
+            if (assignmentIndex >= 0) {
+                nextAssignments[assignmentIndex] = {
+                    ...nextAssignments[assignmentIndex],
+                    status: 'done',
+                    value: content,
+                    annotatedAt: Date.now()
+                };
+            } else {
+                nextAssignments.push({
+                    annotatorId: annotator.id,
+                    status: 'done',
+                    value: content,
+                    annotatedAt: Date.now()
+                });
+            }
+            const global = computeStatusAndFinal(currentDataPoint, nextAssignments);
+            updated[currentIndex] = {
+                ...currentDataPoint,
+                assignments: nextAssignments,
+                status: global.status,
+                finalAnnotation: global.finalAnnotation,
+                annotationDrafts: { ...(currentDataPoint.annotationDrafts || {}), [annotator.id]: '' },
+                annotatorId: currentDataPoint.annotatorId ?? annotator?.id,
+                annotatorName: currentDataPoint.annotatorName ?? annotator?.name,
+                annotatedAt: currentDataPoint.annotatedAt ?? Date.now()
+            };
+        } else {
+            updated[currentIndex] = {
+                ...currentDataPoint,
+                finalAnnotation: content,
+                status: 'accepted',
+                annotatorId: annotator?.id ?? currentDataPoint.annotatorId,
+                annotatorName: annotator?.name ?? currentDataPoint.annotatorName,
+                annotatedAt: annotator ? Date.now() : currentDataPoint.annotatedAt
+            };
+        }
 
         // Move to next if not last
         const nextIndex = currentIndex < dataPoints.length - 1 ? currentIndex + 1 : currentIndex;
@@ -231,14 +321,46 @@ export const useDataLabeling = (projectId?: string) => {
     const handleSaveEdit = (annotator?: AnnotatorMeta) => {
         if (!currentDataPoint) return;
         const updated = [...dataPoints];
-        updated[currentIndex] = {
-            ...currentDataPoint,
-            finalAnnotation: tempAnnotation,
-            status: 'edited',
-            annotatorId: annotator?.id ?? currentDataPoint.annotatorId,
-            annotatorName: annotator?.name ?? currentDataPoint.annotatorName,
-            annotatedAt: annotator ? Date.now() : currentDataPoint.annotatedAt
-        };
+        const assignmentIndex = getAssignmentIndex(currentDataPoint, annotator?.id);
+
+        if (annotator?.id) {
+            const nextAssignments = [...(currentDataPoint.assignments ?? [])];
+            if (assignmentIndex >= 0) {
+                nextAssignments[assignmentIndex] = {
+                    ...nextAssignments[assignmentIndex],
+                    status: 'done',
+                    value: tempAnnotation,
+                    annotatedAt: Date.now()
+                };
+            } else {
+                nextAssignments.push({
+                    annotatorId: annotator.id,
+                    status: 'done',
+                    value: tempAnnotation,
+                    annotatedAt: Date.now()
+                });
+            }
+            const global = computeStatusAndFinal(currentDataPoint, nextAssignments);
+            updated[currentIndex] = {
+                ...currentDataPoint,
+                assignments: nextAssignments,
+                status: global.status,
+                finalAnnotation: global.finalAnnotation,
+                annotationDrafts: { ...(currentDataPoint.annotationDrafts || {}), [annotator.id]: '' },
+                annotatorId: currentDataPoint.annotatorId ?? annotator?.id,
+                annotatorName: currentDataPoint.annotatorName ?? annotator?.name,
+                annotatedAt: currentDataPoint.annotatedAt ?? Date.now()
+            };
+        } else {
+            updated[currentIndex] = {
+                ...currentDataPoint,
+                finalAnnotation: tempAnnotation,
+                status: 'edited',
+                annotatorId: annotator?.id ?? currentDataPoint.annotatorId,
+                annotatorName: annotator?.name ?? currentDataPoint.annotatorName,
+                annotatedAt: annotator ? Date.now() : currentDataPoint.annotatedAt
+            };
+        }
 
         setWorkspaceState({
             dataPoints: updated,
@@ -259,17 +381,38 @@ export const useDataLabeling = (projectId?: string) => {
         }
     };
 
-    const handleRejectAnnotation = () => {
+    const handleRejectAnnotation = (annotator?: AnnotatorMeta) => {
         if (!currentDataPoint) return;
         const updated = [...dataPoints];
-        updated[currentIndex] = {
-            ...currentDataPoint,
-            finalAnnotation: '',
-            status: 'pending',
-            annotatorId: undefined,
-            annotatorName: undefined,
-            annotatedAt: undefined
-        };
+        const assignmentIndex = getAssignmentIndex(currentDataPoint, annotator?.id);
+        if (assignmentIndex >= 0) {
+            const nextAssignments = [...(currentDataPoint.assignments ?? [])];
+            nextAssignments[assignmentIndex] = {
+                ...nextAssignments[assignmentIndex],
+                status: 'pending',
+                value: undefined,
+                annotatedAt: undefined
+            };
+            const global = computeStatusAndFinal(currentDataPoint, nextAssignments);
+            updated[currentIndex] = {
+                ...currentDataPoint,
+                assignments: nextAssignments,
+                status: global.status,
+                finalAnnotation: global.finalAnnotation,
+                annotationDrafts: annotator?.id
+                    ? { ...(currentDataPoint.annotationDrafts || {}), [annotator.id]: '' }
+                    : currentDataPoint.annotationDrafts
+            };
+        } else {
+            updated[currentIndex] = {
+                ...currentDataPoint,
+                finalAnnotation: '',
+                status: 'pending',
+                annotatorId: undefined,
+                annotatorName: undefined,
+                annotatedAt: undefined
+            };
+        }
 
         // Move to next if not last
         const nextIndex = currentIndex < dataPoints.length - 1 ? currentIndex + 1 : currentIndex;
@@ -312,10 +455,28 @@ export const useDataLabeling = (projectId?: string) => {
         }
     };
 
-    const handleHumanAnnotationChange = (content: string) => {
+    const handleHumanAnnotationChange = (content: string, annotator?: AnnotatorMeta) => {
         if (!currentDataPoint) return;
         const updated = [...dataPoints];
-        updated[currentIndex] = { ...currentDataPoint, humanAnnotation: content };
+        const assignmentIndex = getAssignmentIndex(currentDataPoint, annotator?.id);
+        if (assignmentIndex >= 0 && annotator?.id) {
+            const nextAssignments = [...(currentDataPoint.assignments ?? [])];
+            const existing = nextAssignments[assignmentIndex];
+            nextAssignments[assignmentIndex] = {
+                ...existing,
+                status: content.trim().length > 0 ? 'in_progress' : existing.status === 'done' ? 'done' : 'pending'
+            };
+            updated[currentIndex] = {
+                ...currentDataPoint,
+                assignments: nextAssignments,
+                annotationDrafts: {
+                    ...(currentDataPoint.annotationDrafts || {}),
+                    [annotator.id]: content
+                }
+            };
+        } else {
+            updated[currentIndex] = { ...currentDataPoint, humanAnnotation: content };
+        }
 
         setWorkspaceState({
             dataPoints: updated,
@@ -376,8 +537,13 @@ export const useDataLabeling = (projectId?: string) => {
         isLoadingData,
         page,
         totalItems,
-        totalPages: Math.ceil(totalItems / limit),
-        setPage,
+        pageSize: Math.max(1, totalItems || dataPoints.length || 1),
+        totalPages: 1,
+        setPage: () => {},
+        statusCounts: effectiveStatusCounts,
+        globalCompletedCount,
+        globalRemainingCount,
+        globalTotalItems,
 
         // Undo/Redo
         undo,
@@ -388,7 +554,7 @@ export const useDataLabeling = (projectId?: string) => {
         // Computed
         currentDataPoint,
         isCompleted,
-        progress: dataPoints.length > 0 ? (completedCount / dataPoints.length) * 100 : 0,
+        progress: globalProgress,
 
         // Handlers
         handleNext,
